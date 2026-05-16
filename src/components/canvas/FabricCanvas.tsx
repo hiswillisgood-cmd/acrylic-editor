@@ -5,7 +5,10 @@ import type { Point } from '@/stores/editorStore'
 import { setCanvasRef } from '@/stores/canvasRef'
 import { mmToScreenPx } from '@/utils/unitConvert'
 import { parseSVGCutLine } from '@/utils/svgParser'
-import { offsetParallel, resampleEvenly } from '@/utils/cutlineUtils'
+import {
+  offsetParallel, resampleEvenly,
+  unionPolygons, circleToPolygon, roundedRectToPolygon, ellipseToPolygon,
+} from '@/utils/cutlineUtils'
 
 const CANVAS_BG    = '#e5e7eb'
 const PRODUCT_BG   = '#ffffff'
@@ -121,25 +124,30 @@ interface HoleOptions {
   positions: Point[]
   zoom: number
   snapFn: (x: number, y: number) => Point
+  // hole 위치가 바뀔 때마다 호출 — cut-line polygon을 hole circles와 union해서 재구성
+  onPositionsChange: (positions: Point[]) => void
 }
 
-function renderHoleGroups({ canvas, positions, zoom, snapFn }: HoleOptions) {
+function renderHoleGroups({ canvas, positions, zoom, snapFn, onPositionsChange }: HoleOptions): fabric.Group[] {
   const outerR = mmToScreenPx(3.5) * zoom
   const innerR = mmToScreenPx(1.5) * zoom
   const groups: fabric.Group[] = []
 
+  // outer ring은 cut-line union 결과에 포함되므로 hole 객체에는 inner 타공점만
+  // (드래그 hit area 확보 위해 outer 영역만큼의 invisible 원도 함께 그룹화)
   for (const pos of positions) {
-    const outer = new fabric.Circle({
+    const hitArea = new fabric.Circle({
       left: 0, top: 0, radius: outerR,
-      fill: PRODUCT_BG, stroke: CUT_COLOR, strokeWidth: 1.5,
+      fill: 'transparent', stroke: 'transparent',
       originX: 'center', originY: 'center',
     })
+    // 타공 커팅 라인 — 빨간 ring (실제 drill cut path를 시각화), 안쪽 투명
     const inner = new fabric.Circle({
       left: 0, top: 0, radius: innerR,
-      fill: CANVAS_BG, stroke: HOLE_COLOR, strokeWidth: 1.5,
+      fill: 'transparent', stroke: CUT_COLOR, strokeWidth: 1.5,
       originX: 'center', originY: 'center',
     })
-    const group = new fabric.Group([outer, inner], {
+    const group = new fabric.Group([hitArea, inner], {
       left: pos.x, top: pos.y,
       originX: 'center', originY: 'center',
       selectable: true,
@@ -173,17 +181,26 @@ function renderHoleGroups({ canvas, positions, zoom, snapFn }: HoleOptions) {
         }
       }
       group.set({ left: fx, top: fy })
+      // drag 중 cut-line polygon을 hole circles와 union해서 재구성 (한 path)
+      onPositionsChange(groups.map((g) => ({ x: g.left ?? 0, y: g.top ?? 0 })))
       canvas.renderAll()
     })
 
     canvas.add(group)
   }
+
+  // 초기 배치 후에도 union 적용
+  onPositionsChange(groups.map((g) => ({ x: g.left ?? 0, y: g.top ?? 0 })))
+
+  return groups
 }
 
 // ─── 레이어 순서 정리 ─────────────────────────────────────────────────────────
 
-// z-order: 아래 → 위 순서로 명시. 칼선은 항상 최상위
-const Z_ORDER = ['product-area', 'user-image', 'hole', 'cut-line'] as const
+// z-order: 아래 → 위. hole이 cut-line 위에 있어야 hole의 흰 fill이
+// cut-line stroke를 가려서 "고리 외곽 + 칼선" 한 외곽선 모양이 됨.
+// cut-line은 evented:false라 마우스 이벤트는 그대로 hole로 전달됨.
+const Z_ORDER = ['product-area', 'user-image', 'cut-line', 'hole'] as const
 
 function reorder(canvas: fabric.Canvas) {
   for (const tag of Z_ORDER) {
@@ -215,11 +232,15 @@ export default function FabricCanvas() {
   const zoom           = useEditorStore(s => s.zoom)
   const holeCount      = useEditorStore(s => s.holeCount)
   const holePosition   = useEditorStore(s => s.holePosition)
-  const frontImageData = useEditorStore(s => s.frontImageData)
   const productType    = useEditorStore(s => s.productType)
   const cutShape       = useEditorStore(s => s.cutShape)
   const cutLineSvgData = useEditorStore(s => s.cutLineSvgData)
   const setCutLinePolygon = useEditorStore(s => s.setCutLinePolygon)
+  const activeSide     = useEditorStore(s => s.activeSide)
+  const frontImages    = useEditorStore(s => s.frontImages)
+  const backImages     = useEditorStore(s => s.backImages)
+  const corolotMode    = useEditorStore(s => s.corolotMode)
+  const selectedImageId = useEditorStore(s => s.selectedImageId)
 
   // ── 캔버스 초기화 ────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -288,63 +309,32 @@ export default function FabricCanvas() {
 
     const needHoles = holeCount > 0 && (productType === 'keyring' || productType === 'corolot')
 
+    // ── 1. cut-line의 base polygon 및 product 영역 polygon 계산 ────────────────
+    let productAreaPoly: Point[] | null = null
+    let cutLineBase: Point[] | null = null
+
+    let snapFn: (x: number, y: number) => Point = (x, y) => ({ x, y })
+    let positions: Point[] = []
+    const protrude = mmToScreenPx(3.5) * zoom * 0.4
+
     if (cutShape === 'rectangle') {
-      // 제품 영역
-      const bg = new fabric.Rect({
-        left: cx - pW / 2, top: cy - pH / 2, width: pW, height: pH,
-        fill: PRODUCT_BG, rx: rad, ry: rad,
-        selectable: false, evented: false,
-        shadow: new fabric.Shadow({ color: 'rgba(0,0,0,0.12)', blur: 16, offsetX: 0, offsetY: 4 }),
-      })
-      tag(bg, 'product-area')
-      canvas.add(bg)
-
-      // 칼선
+      productAreaPoly = roundedRectToPolygon(cx, cy, pW / 2, pH / 2, rad, 12)
       const clW = pW + off * 2, clH = pH + off * 2
-      const cl = new fabric.Rect({
-        left: cx - clW / 2, top: cy - clH / 2, width: clW, height: clH,
-        fill: 'transparent', stroke: CUT_COLOR, strokeWidth: 1.5,
-        rx: rad + off, ry: rad + off,
-        selectable: false, evented: false,
-      })
-      tag(cl, 'cut-line')
-      canvas.add(cl)
-
-      // 고리
+      const halfW = clW / 2, halfH = clH / 2
+      cutLineBase = roundedRectToPolygon(cx, cy, halfW, halfH, rad + off, 12)
       if (needHoles) {
-        const halfW = clW / 2, halfH = clH / 2
-        const protrude = mmToScreenPx(3.5) * zoom * 0.4
-        const snapFn = (px: number, py: number) => snapToRoundedRect(px, py, cx, cy, halfW, halfH, rad + off, protrude)
-        const positions = holePositions(cx, cy, halfW, halfH, holeCount, holePosition, protrude, rad + off)
-        renderHoleGroups({ canvas, positions, zoom, snapFn })
+        snapFn = (px, py) => snapToRoundedRect(px, py, cx, cy, halfW, halfH, rad + off, protrude)
+        positions = holePositions(cx, cy, halfW, halfH, holeCount, holePosition, protrude, rad + off)
       }
-
     } else if (cutShape === 'circle') {
       const rx = pW / 2, ry = pH / 2
-      const bg = new fabric.Ellipse({
-        left: cx - rx, top: cy - ry, rx, ry,
-        fill: PRODUCT_BG, selectable: false, evented: false,
-        shadow: new fabric.Shadow({ color: 'rgba(0,0,0,0.12)', blur: 16, offsetX: 0, offsetY: 4 }),
-      })
-      tag(bg, 'product-area')
-      canvas.add(bg)
-
+      productAreaPoly = ellipseToPolygon(cx, cy, rx, ry, 64)
       const crx = rx + off, cry = ry + off
-      const cl = new fabric.Ellipse({
-        left: cx - crx, top: cy - cry, rx: crx, ry: cry,
-        fill: 'transparent', stroke: CUT_COLOR, strokeWidth: 1.5,
-        selectable: false, evented: false,
-      })
-      tag(cl, 'cut-line')
-      canvas.add(cl)
-
+      cutLineBase = ellipseToPolygon(cx, cy, crx, cry, 64)
       if (needHoles) {
-        const protrude = mmToScreenPx(3.5) * zoom * 0.4
-        const snapFn = (px: number, py: number) => snapToEllipse(px, py, cx, cy, crx, cry, protrude)
-        const positions = ellipseHolePositions(cx, cy, crx, cry, holeCount, holePosition, protrude)
-        renderHoleGroups({ canvas, positions, zoom, snapFn })
+        snapFn = (px, py) => snapToEllipse(px, py, cx, cy, crx, cry, protrude)
+        positions = ellipseHolePositions(cx, cy, crx, cry, holeCount, holePosition, protrude)
       }
-
     } else {
       // 자유형
       if (!cutLineSvgData || !parsedSvgRef.current) {
@@ -353,37 +343,56 @@ export default function FabricCanvas() {
       }
       const parsed = parsedSvgRef.current
       let screenPoly = svgPolyToScreen(parsed.polygon, parsed.bbox, pW, pH, cx, cy)
-      // 폴리곤 winding을 CCW(시각적)로 정규화 → normal `(-ty, tx)`가 항상 outward 가리킴
       if (polygonSignedSum(screenPoly) < 0) screenPoly = screenPoly.slice().reverse()
-
-      // 제품 영역
-      const bg = new fabric.Polygon(screenPoly, {
-        fill: PRODUCT_BG, selectable: false, evented: false,
-        shadow: new fabric.Shadow({ color: 'rgba(0,0,0,0.12)', blur: 16, offsetX: 0, offsetY: 4 }),
-      })
-      tag(bg, 'product-area')
-      canvas.add(bg)
-
-      // 칼선 (오프셋 폴리곤) — Clipper2가 self-intersection / holes 자동 처리
-      const cutPoly = offsetParallel(screenPoly, off)
-      const cl = new fabric.Polygon(cutPoly, {
-        fill: 'transparent', stroke: CUT_COLOR, strokeWidth: 1.5,
-        selectable: false, evented: false,
-      })
-      tag(cl, 'cut-line')
-      canvas.add(cl)
-
-      // 칼선 폴리곤 저장 (고리 스냅 + 외부 참조용)
-      const sampled = resampleEvenly(cutPoly, 300)
-      setCutLinePolygon(sampled)
-
+      productAreaPoly = screenPoly
+      cutLineBase = offsetParallel(screenPoly, off)
       if (needHoles) {
-        const protrude = mmToScreenPx(3.5) * zoom * 0.4
-        const snapFn = (px: number, py: number) => snapToPolygon(px, py, sampled, protrude)
-        // 자유형: 칼선 폴리곤 위에 균등 배치
-        const positions = freeformHolePositions(sampled, holeCount, protrude)
-        renderHoleGroups({ canvas, positions, zoom, snapFn })
+        const sampled = resampleEvenly(cutLineBase, 300)
+        setCutLinePolygon(sampled)
+        snapFn = (px, py) => snapToPolygon(px, py, sampled, protrude)
+        positions = freeformHolePositions(sampled, holeCount, protrude)
       }
+    }
+
+    if (!productAreaPoly || !cutLineBase) {
+      canvas.renderAll()
+      return
+    }
+
+    // ── 2. product 영역 (polygon) ───────────────────────────────────────────────
+    const bg = new fabric.Polygon(productAreaPoly, {
+      fill: PRODUCT_BG, selectable: false, evented: false,
+      shadow: new fabric.Shadow({ color: 'rgba(0,0,0,0.12)', blur: 16, offsetX: 0, offsetY: 4 }),
+    })
+    tag(bg, 'product-area')
+    canvas.add(bg)
+
+    // ── 3. cut-line — hole circles와 union해서 단일 polygon ──────────────────
+    const holeOuterR = mmToScreenPx(3.5) * zoom
+    const buildMergedCutLine = (holeCenters: Point[]): Point[] => {
+      if (!cutLineBase || holeCenters.length === 0) return cutLineBase ?? []
+      const holePolys = holeCenters.map((p) => circleToPolygon(p.x, p.y, holeOuterR, 48))
+      const merged = unionPolygons([cutLineBase, ...holePolys])
+      return merged.length >= 3 ? merged : cutLineBase
+    }
+    const cl = new fabric.Polygon(buildMergedCutLine(positions), {
+      fill: 'transparent', stroke: CUT_COLOR, strokeWidth: 1.5,
+      selectable: false, evented: false,
+      objectCaching: false,  // points 변경 시 즉시 재렌더
+    })
+    tag(cl, 'cut-line')
+    canvas.add(cl)
+
+    // ── 4. 고리 (drag 시 cut-line polygon 재계산) ───────────────────────────────
+    if (needHoles && positions.length > 0) {
+      renderHoleGroups({
+        canvas, positions, zoom, snapFn,
+        onPositionsChange: (newCenters) => {
+          const merged = buildMergedCutLine(newCenters)
+          cl.set({ points: merged })
+          cl.setCoords()
+        },
+      })
     }
 
     reorder(canvas)
@@ -393,35 +402,157 @@ export default function FabricCanvas() {
     holeCount, holePosition, productType, cutShape, cutLineSvgData, canvasSize,
   ])
 
-  // ── 이미지 배치 ──────────────────────────────────────────────────────────────
+  // ── 다중 이미지 배치 (incremental sync) ──────────────────────────────────────
+  const imagesMapRef = useRef<Map<string, fabric.FabricImage>>(new Map())
+  const loadingIdsRef = useRef<Set<string>>(new Set())
+
+  // 현재 표시 대상 이미지 배열 (corolot 양면 처리)
+  const activeImages = (() => {
+    if (productType === 'corolot' && corolotMode === 'different-image') {
+      return activeSide === 'back' ? backImages : frontImages
+    }
+    return frontImages
+  })()
+
   useEffect(() => {
     const canvas = fabricRef.current
     if (!canvas) return
     if (canvasSize.w <= 0 || canvasSize.h <= 0) return
-    removeByTag(canvas, 'user-image')
 
-    if (!frontImageData) { canvas.renderAll(); return }
+    const cx = canvasSize.w / 2
+    const cy = canvasSize.h / 2
+    const map = imagesMapRef.current
+    const newIds = new Set(activeImages.map((i) => i.id))
 
-    const imgEl = new Image()
-    imgEl.onload = () => {
-      removeByTag(canvas, 'user-image')
-      const pW  = mmToScreenPx(width) * zoom
-      const pH  = mmToScreenPx(height) * zoom
-      const scale = Math.min(pW / imgEl.width, pH / imgEl.height) * 0.9
-      const fImg = new fabric.FabricImage(imgEl, {
-        left: canvasSize.w / 2 - (imgEl.width * scale) / 2,
-        top:  canvasSize.h / 2 - (imgEl.height * scale) / 2,
-        selectable: true, centeredScaling: true, centeredRotation: true,
+    // 제거된 이미지
+    for (const [id, obj] of Array.from(map.entries())) {
+      if (!newIds.has(id)) {
+        canvas.remove(obj)
+        map.delete(id)
+      }
+    }
+
+    // 추가 / 업데이트
+    for (const img of activeImages) {
+      const existing = map.get(img.id)
+      if (existing) {
+        existing.set({
+          left: cx + img.x,
+          top: cy + img.y,
+          scaleX: img.scaleX,
+          scaleY: img.scaleY,
+          angle: img.angle,
+          visible: img.visible,
+        })
+      } else {
+        // 비동기 로딩 중인 id는 건너뜀 (race condition으로 중복 추가 방지)
+        if (loadingIdsRef.current.has(img.id)) continue
+        loadingIdsRef.current.add(img.id)
+        // 비동기 로드. 초기 scaleX/scaleY가 1이면 캔버스에 맞춰 자동 fit
+        const el = new Image()
+        const targetImg = img
+        el.onload = () => {
+          loadingIdsRef.current.delete(targetImg.id)
+          // 로드 완료 시점에 이미 store에서 제거됐다면 추가 안 함
+          const st = useEditorStore.getState()
+          const sideKey = (st.productType === 'corolot' && st.corolotMode === 'different-image' && activeSide === 'back') ? 'backImages' : 'frontImages'
+          if (!st[sideKey].some((i) => i.id === targetImg.id)) return
+          // 이미 map에 있으면 중복 추가 방지
+          if (map.has(targetImg.id)) return
+          // 첫 추가 시 product 영역에 맞도록 자동 scale (스토어의 1,1을 화면 scale로 환산)
+          const pW = mmToScreenPx(width) * zoom
+          const pH = mmToScreenPx(height) * zoom
+          const autoFit = Math.min(pW / el.width, pH / el.height) * 0.9
+          const sX = targetImg.scaleX === 1 && targetImg.x === 0 && targetImg.y === 0 ? autoFit : targetImg.scaleX
+          const sY = targetImg.scaleY === 1 && targetImg.x === 0 && targetImg.y === 0 ? autoFit : targetImg.scaleY
+          const fImg = new fabric.FabricImage(el, {
+            left: cx + targetImg.x,
+            top:  cy + targetImg.y,
+            scaleX: sX,
+            scaleY: sY,
+            angle: targetImg.angle,
+            originX: 'center',
+            originY: 'center',
+            centeredScaling: true,
+            centeredRotation: true,
+            selectable: true,
+            visible: targetImg.visible,
+          })
+          tag(fImg, 'user-image')
+          ;(fImg as Tagged & { _imageId?: string })._imageId = targetImg.id
+          map.set(targetImg.id, fImg)
+          canvas.add(fImg)
+          // 초기 자동 fit이 적용되었으면 store에도 반영
+          if (sX !== targetImg.scaleX) {
+            useEditorStore.getState().updateImage(activeSide, targetImg.id, { scaleX: sX, scaleY: sY })
+          }
+          reorder(canvas)
+          canvas.renderAll()
+        }
+        el.src = img.dataUrl
+      }
+    }
+
+    // 같은 면의 이미지들 z-order를 store 배열 순서대로 정렬 (마지막 = 가장 위)
+    for (const img of activeImages) {
+      const obj = map.get(img.id)
+      if (obj) canvas.bringObjectToFront(obj)
+    }
+    reorder(canvas) // 칼선이 다시 최상위로
+    canvas.renderAll()
+  }, [activeImages, productType, corolotMode, activeSide, canvasSize, width, height, zoom])
+
+  // ── Fabric → store sync (drag/scale/rotate, selection) ───────────────────────
+  useEffect(() => {
+    const canvas = fabricRef.current
+    if (!canvas) return
+
+    const handleModified = (e: { target?: fabric.FabricObject }) => {
+      const obj = e.target as (fabric.FabricObject & { _tag?: string; _imageId?: string }) | undefined
+      if (!obj || obj._tag !== 'user-image' || !obj._imageId) return
+      const cx = canvasSize.w / 2
+      const cy = canvasSize.h / 2
+      useEditorStore.getState().updateImage(activeSide, obj._imageId, {
+        x: (obj.left ?? 0) - cx,
+        y: (obj.top  ?? 0) - cy,
+        scaleX: obj.scaleX ?? 1,
+        scaleY: obj.scaleY ?? 1,
+        angle:  obj.angle  ?? 0,
       })
-      fImg.scale(scale)
-      tag(fImg, 'user-image')
-      canvas.add(fImg)
-      reorder(canvas)
+    }
+    const handleSelected = (e: { selected?: fabric.FabricObject[] }) => {
+      const obj = e.selected?.[0] as (fabric.FabricObject & { _imageId?: string }) | undefined
+      if (obj?._imageId) useEditorStore.getState().setSelectedImageId(obj._imageId)
+    }
+    const handleCleared = () => useEditorStore.getState().setSelectedImageId(null)
+
+    canvas.on('object:modified', handleModified)
+    canvas.on('selection:created', handleSelected)
+    canvas.on('selection:updated', handleSelected)
+    canvas.on('selection:cleared', handleCleared)
+    return () => {
+      canvas.off('object:modified', handleModified)
+      canvas.off('selection:created', handleSelected)
+      canvas.off('selection:updated', handleSelected)
+      canvas.off('selection:cleared', handleCleared)
+    }
+  }, [activeSide, canvasSize])
+
+  // ── 사이드바에서 선택 변경 시 canvas active object 동기화 ────────────────────
+  useEffect(() => {
+    const canvas = fabricRef.current
+    if (!canvas) return
+    if (!selectedImageId) {
       canvas.discardActiveObject()
       canvas.renderAll()
+      return
     }
-    imgEl.src = frontImageData
-  }, [frontImageData, width, height, zoom, canvasSize])
+    const obj = imagesMapRef.current.get(selectedImageId)
+    if (obj && canvas.getActiveObject() !== obj) {
+      canvas.setActiveObject(obj)
+      canvas.renderAll()
+    }
+  }, [selectedImageId])
 
   return (
     <div ref={containerRef} className="w-full h-full relative overflow-hidden">

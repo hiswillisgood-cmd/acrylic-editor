@@ -1,5 +1,6 @@
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useEditorStore } from '@/stores/editorStore'
+import { getCanvasRef } from '@/stores/canvasRef'
 
 type PreviewTab = 'front' | 'white' | 'back' | 'side'
 
@@ -10,11 +11,31 @@ const TABS: { value: PreviewTab; label: string }[] = [
   { value: 'side',  label: '측면(자동반전)' },
 ]
 
+// 캔버스에서 user-image 객체만 보이게 한 뒤 PNG로 export, 나머지는 일시 숨김
+function snapshotDesignImages(): string | null {
+  const canvas = getCanvasRef()
+  if (!canvas) return null
+  type Maybe = { _tag?: string; visible?: boolean }
+  const restore: Array<{ obj: Maybe; visible: boolean | undefined }> = []
+  for (const o of canvas.getObjects()) {
+    const t = (o as unknown as Maybe)._tag
+    if (t !== 'user-image') {
+      restore.push({ obj: o as unknown as Maybe, visible: o.visible })
+      o.visible = false
+    }
+  }
+  canvas.renderAll()
+  const data = canvas.toDataURL({ format: 'png', multiplier: 1 })
+  for (const r of restore) (r.obj as unknown as { visible: boolean | undefined }).visible = r.visible
+  canvas.renderAll()
+  return data
+}
+
 export default function PreviewModal() {
   const [activeTab, setActiveTab] = useState<PreviewTab>('front')
   const setPreviewOpen = useEditorStore((s) => s.setPreviewOpen)
-  const frontImage     = useEditorStore((s) => s.frontImageData)
-  const backImage      = useEditorStore((s) => s.backImageData)
+  const frontImages    = useEditorStore((s) => s.frontImages)
+  const backImages     = useEditorStore((s) => s.backImages)
   const corolotMode    = useEditorStore((s) => s.corolotMode)
   const productType    = useEditorStore((s) => s.productType)
   const cutShape       = useEditorStore((s) => s.cutShape)
@@ -22,10 +43,33 @@ export default function PreviewModal() {
   const height         = useEditorStore((s) => s.height)
   const cornerRadius   = useEditorStore((s) => s.cornerRadius)
   const cutLineSvgData = useEditorStore((s) => s.cutLineSvgData)
+  const activeSide     = useEditorStore((s) => s.activeSide)
 
   const hasDualSide  = productType === 'corolot'
   const isFreeform   = cutShape === 'freeform'
-  const displayImage = (activeTab === 'back' && corolotMode === 'different-image') ? backImage : frontImage
+
+  // 활성 면 (different-image 모드의 back 탭) 결정
+  const wantBack = activeTab === 'back' && corolotMode === 'different-image'
+  const hasAnyImage = useMemo(
+    () => (wantBack ? backImages : frontImages).some((i) => i.visible),
+    [wantBack, frontImages, backImages],
+  )
+
+  // 미리보기 진입 시(또는 탭 변경 시) 캔버스 합성 PNG 캡처
+  const [snapshot, setSnapshot] = useState<string | null>(null)
+  useEffect(() => {
+    // 다른 면(back) 미리보기는 store의 backImages를 직접 합성하기 어려우므로
+    // 같은 그림 모드 또는 현재 activeSide 표시일 때만 캔버스 스냅샷 사용
+    if (wantBack && activeSide !== 'back') {
+      // back 면 별도 이미지가 활성화되지 않은 상태 — 첫 visible 이미지 dataUrl로 폴백
+      const firstVis = backImages.find((i) => i.visible)
+      setSnapshot(firstVis?.dataUrl ?? null)
+    } else {
+      setSnapshot(snapshotDesignImages())
+    }
+  }, [activeTab, wantBack, activeSide, frontImages, backImages, corolotMode])
+
+  const displayImage = snapshot
 
   const visibleTabs = TABS.filter(t =>
     hasDualSide || (t.value === 'front' || t.value === 'white')

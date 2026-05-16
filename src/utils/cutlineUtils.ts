@@ -1,4 +1,93 @@
+import { Clipper, FillRule } from 'clipper2-js'
+
 export interface Point { x: number; y: number }
+
+// ─── Boolean Union (단일 칼선 path를 만들기 위해 cut-line + hole 외곽을 합침) ─
+
+const UNION_SCALE = 100
+
+// 화면 좌표(y down) 기준 polygon을 시각적 CW로 정규화 — Clipper2 Union의 winding 일치를 보장
+function ensureCW(poly: Point[]): Point[] {
+  let area = 0
+  for (let i = 0; i < poly.length; i++) {
+    const p = poly[i], q = poly[(i + 1) % poly.length]
+    area += p.x * q.y - q.x * p.y
+  }
+  return area > 0 ? poly : poly.slice().reverse()
+}
+
+/**
+ * 여러 polygon을 Boolean Union으로 합쳐 단일 외곽 polygon을 반환.
+ * 입력 polygon들의 winding이 달라도 자동으로 CW로 통일 — winding 불일치로 hole이
+ * "내부 구멍"으로 해석되는 케이스 방지 (자유형 cut-line CCW + hole circle CW 등).
+ */
+export function unionPolygons(polygons: Point[][]): Point[] {
+  if (polygons.length === 0) return []
+  if (polygons.length === 1) return polygons[0]
+  const subject = polygons.map(poly =>
+    ensureCW(poly).map(p => ({ x: Math.round(p.x * UNION_SCALE), y: Math.round(p.y * UNION_SCALE) })),
+  )
+  const result = Clipper.Union(subject as never, undefined, FillRule.NonZero)
+  if (!result || result.length === 0) return polygons[0]
+  let best = result[0]
+  let bestArea = Math.abs(Clipper.area(best))
+  for (let i = 1; i < result.length; i++) {
+    const a = Math.abs(Clipper.area(result[i]))
+    if (a > bestArea) { bestArea = a; best = result[i] }
+  }
+  return best.map((p: { x: number; y: number }) => ({ x: p.x / UNION_SCALE, y: p.y / UNION_SCALE }))
+}
+
+/** 원을 segments 분할 polygon으로 변환 (cx, cy 중심, 반지름 r) */
+export function circleToPolygon(cx: number, cy: number, r: number, segments = 48): Point[] {
+  const out: Point[] = []
+  for (let i = 0; i < segments; i++) {
+    const a = (i / segments) * Math.PI * 2
+    out.push({ x: cx + Math.cos(a) * r, y: cy + Math.sin(a) * r })
+  }
+  return out
+}
+
+/** 둥근 사각형을 polygon으로 변환 (cornerR이 0이면 일반 사각형) */
+export function roundedRectToPolygon(
+  cx: number, cy: number, halfW: number, halfH: number, cornerR: number,
+  cornerSteps = 12,
+): Point[] {
+  const r = Math.max(0, Math.min(cornerR, halfW, halfH))
+  if (r < 0.5) {
+    return [
+      { x: cx - halfW, y: cy - halfH },
+      { x: cx + halfW, y: cy - halfH },
+      { x: cx + halfW, y: cy + halfH },
+      { x: cx - halfW, y: cy + halfH },
+    ]
+  }
+  const out: Point[] = []
+  // 각 코너의 호 중심
+  const corners = [
+    { ax: cx + halfW - r, ay: cy - halfH + r, a0: -Math.PI / 2, a1: 0 },          // 우상
+    { ax: cx + halfW - r, ay: cy + halfH - r, a0: 0,            a1: Math.PI / 2 }, // 우하
+    { ax: cx - halfW + r, ay: cy + halfH - r, a0: Math.PI / 2,  a1: Math.PI },     // 좌하
+    { ax: cx - halfW + r, ay: cy - halfH + r, a0: Math.PI,      a1: 3 * Math.PI / 2 }, // 좌상
+  ]
+  for (const c of corners) {
+    for (let i = 0; i <= cornerSteps; i++) {
+      const t = c.a0 + ((c.a1 - c.a0) * i) / cornerSteps
+      out.push({ x: c.ax + Math.cos(t) * r, y: c.ay + Math.sin(t) * r })
+    }
+  }
+  return out
+}
+
+/** 타원을 polygon으로 변환 */
+export function ellipseToPolygon(cx: number, cy: number, rx: number, ry: number, segments = 64): Point[] {
+  const out: Point[] = []
+  for (let i = 0; i < segments; i++) {
+    const a = (i / segments) * Math.PI * 2
+    out.push({ x: cx + Math.cos(a) * rx, y: cy + Math.sin(a) * ry })
+  }
+  return out
+}
 
 function lineLineIntersect(
   p1x: number, p1y: number, d1x: number, d1y: number,

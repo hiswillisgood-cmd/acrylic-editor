@@ -1,5 +1,6 @@
 import { useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
+import * as fabric from 'fabric'
 import { useEditorStore } from '@/stores/editorStore'
 import { getCanvasRef } from '@/stores/canvasRef'
 import { PRODUCTS } from '@/config/products'
@@ -8,6 +9,7 @@ import EditorLayout from '@/components/layout/EditorLayout'
 import PreviewModal from '@/components/preview/PreviewModal'
 import { exportCanvasAsPNG, downloadDataURL } from '@/hooks/useCanvasExport'
 import { buildOrderData, downloadJSON } from '@/utils/exportUtils'
+import { screenPxToMm } from '@/utils/unitConvert'
 
 export default function Editor() {
   const { productType } = useParams<{ productType: string }>()
@@ -86,6 +88,30 @@ function PreviewButton() {
 function OrderButton() {
   const handleOrder = () => {
     const s = useEditorStore.getState()
+    const canvas = getCanvasRef()
+    // 캔버스에서 union된 cut-line polygon과 고리 중심 좌표 추출
+    // 보이는 게 곧 제작 데이터 — 캔버스 px를 제품 중심 원점 mm 좌표로 변환
+    type Tagged = { _tag?: string }
+    let cutLinePolygon: { x: number; y: number }[] | null = null
+    const holePositions: { x: number; y: number }[] = []
+    if (canvas) {
+      const cx = canvas.width  / 2
+      const cy = canvas.height / 2
+      const zoom = s.zoom || 1
+      const toMm = (p: { x: number; y: number }) => ({
+        x: +(screenPxToMm(p.x - cx) / zoom).toFixed(3),
+        y: +(screenPxToMm(p.y - cy) / zoom).toFixed(3),
+      })
+      for (const o of canvas.getObjects()) {
+        const tag = (o as unknown as Tagged)._tag
+        if (tag === 'cut-line' && (o as fabric.Polygon).points) {
+          cutLinePolygon = (o as fabric.Polygon).points.map(toMm)
+        } else if (tag === 'hole') {
+          holePositions.push(toMm({ x: o.left ?? 0, y: o.top ?? 0 }))
+        }
+      }
+    }
+
     const orderData = buildOrderData({
       productType: s.productType,
       width: s.width,
@@ -99,12 +125,11 @@ function OrderButton() {
       activeSide: s.activeSide,
       cutLineOffset: s.cutLineOffset,
       zoom: s.zoom,
-      frontImageData: s.frontImageData,
-      backImageData: s.backImageData,
+      frontImages: s.frontImages,
+      backImages: s.backImages,
       cutLineSvgData: s.cutLineSvgData,
-    })
+    }, { cutLinePolygon, holePositions })
 
-    const canvas = getCanvasRef()
     if (canvas) orderData.frontImage = exportCanvasAsPNG(canvas)
 
     downloadJSON(orderData, `order-${s.productType}-${Date.now()}.json`)
