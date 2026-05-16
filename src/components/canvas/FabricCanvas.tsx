@@ -328,12 +328,32 @@ export default function FabricCanvas() {
       }
     } else if (cutShape === 'circle') {
       const rx = pW / 2, ry = pH / 2
-      productAreaPoly = ellipseToPolygon(cx, cy, rx, ry, 64)
       const crx = rx + off, cry = ry + off
-      cutLineBase = ellipseToPolygon(cx, cy, crx, cry, 64)
       if (needHoles) {
+        // hole 있을 때만 union 위해 polygon (segments 128로 매끄럽게)
+        productAreaPoly = ellipseToPolygon(cx, cy, rx, ry, 128)
+        cutLineBase = ellipseToPolygon(cx, cy, crx, cry, 128)
         snapFn = (px, py) => snapToEllipse(px, py, cx, cy, crx, cry, protrude)
         positions = ellipseHolePositions(cx, cy, crx, cry, holeCount, holePosition, protrude)
+      } else {
+        // hole 없으면 native ellipse(4 anchor bezier)로 그려 진짜 매끄러운 곡선
+        const bgEl = new fabric.Ellipse({
+          left: cx - rx, top: cy - ry, rx, ry,
+          fill: PRODUCT_BG, selectable: false, evented: false,
+          shadow: new fabric.Shadow({ color: 'rgba(0,0,0,0.12)', blur: 16, offsetX: 0, offsetY: 4 }),
+        })
+        tag(bgEl, 'product-area')
+        canvas.add(bgEl)
+        const clEl = new fabric.Ellipse({
+          left: cx - crx, top: cy - cry, rx: crx, ry: cry,
+          fill: 'transparent', stroke: CUT_COLOR, strokeWidth: 1.5,
+          selectable: false, evented: false,
+        })
+        tag(clEl, 'cut-line')
+        canvas.add(clEl)
+        reorder(canvas)
+        canvas.renderAll()
+        return
       }
     } else {
       // 자유형
