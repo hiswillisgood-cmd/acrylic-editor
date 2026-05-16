@@ -16,7 +16,7 @@ export default function ThicknessPanel({ options }: Props) {
           <button
             key={t}
             onClick={() => setThickness(t)}
-            className={`flex-1 py-2 text-sm rounded-lg border cursor-pointer transition-colors ${
+            className={`flex-1 py-2 text-sm rounded-md border cursor-pointer transition-colors ${
               thickness === t
                 ? 'border-blue-500 bg-blue-50 text-blue-700 font-medium'
                 : 'border-gray-200 text-gray-500 hover:border-gray-300'

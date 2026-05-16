@@ -26,7 +26,7 @@ export default function BasePlatePanel({ shapes }: Props) {
             <button
               key={shape}
               onClick={() => setBasePlateShape(shape)}
-              className={`flex flex-col items-center gap-1 py-3 rounded-lg border cursor-pointer transition-colors ${
+              className={`flex flex-col items-center gap-1 py-3 rounded-md border cursor-pointer transition-colors ${
                 basePlateShape === shape
                   ? 'border-blue-500 bg-blue-50 text-blue-700'
                   : 'border-gray-200 text-gray-500 hover:border-gray-300'

@@ -1,547 +1,505 @@
 import { useRef, useEffect, useState } from 'react'
 import * as fabric from 'fabric'
 import { useEditorStore } from '@/stores/editorStore'
+import type { Point } from '@/stores/editorStore'
 import { setCanvasRef } from '@/stores/canvasRef'
 import { mmToScreenPx } from '@/utils/unitConvert'
-import { extractContour, hasTransparency } from '@/utils/contourTrace'
+import { parseSVGCutLine } from '@/utils/svgParser'
+import { offsetParallel, resampleEvenly } from '@/utils/cutlineUtils'
 
-const CANVAS_BG = '#e5e7eb'
-const PRODUCT_BG = '#ffffff'
-const CUT_LINE_COLOR = '#ef4444'
-const HOLE_COLOR = '#9ca3af'
+const CANVAS_BG    = '#e5e7eb'
+const PRODUCT_BG   = '#ffffff'
+const CUT_COLOR    = '#ef4444'
+const HOLE_COLOR   = '#9ca3af'
 
-interface TaggedObject extends fabric.FabricObject {
-  _editorType?: string
+// ─── 태그 유틸 ────────────────────────────────────────────────────────────────
+
+interface Tagged extends fabric.FabricObject { _tag?: string }
+
+function tag(obj: fabric.FabricObject, t: string) { (obj as Tagged)._tag = t }
+
+function removeByTag(canvas: fabric.Canvas, ...tags: string[]) {
+  const set = new Set(tags)
+  const toRemove = canvas.getObjects().filter(o => set.has((o as Tagged)._tag ?? ''))
+  if (toRemove.length) canvas.remove(...toRemove)
 }
 
-function removeByType(canvas: fabric.Canvas, ...types: string[]) {
-  const toRemove = canvas.getObjects().filter(
-    (o) => types.includes((o as TaggedObject)._editorType ?? '')
-  )
-  toRemove.forEach((o) => canvas.remove(o))
+// ─── 좌표 변환 ────────────────────────────────────────────────────────────────
+
+// SVG 내부 좌표 → 화면 픽셀 (중앙 정렬)
+function svgPolyToScreen(
+  polygon: Point[],
+  bbox: { x: number; y: number; w: number; h: number },
+  targetW: number,
+  targetH: number,
+  cx: number,
+  cy: number,
+): Point[] {
+  if (!bbox.w || !bbox.h) return polygon
+  const scale = Math.min(targetW / bbox.w, targetH / bbox.h)
+  const dx = cx - (bbox.x + bbox.w / 2) * scale
+  const dy = cy - (bbox.y + bbox.h / 2) * scale
+  return polygon.map(p => ({ x: p.x * scale + dx, y: p.y * scale + dy }))
 }
 
-function tagObject(obj: fabric.FabricObject, type: string) {
-  (obj as TaggedObject)._editorType = type
+// 화면 좌표(y down) 기준 폴리곤 부호 면적 — 음수면 시각적 CW, 양수면 CCW
+function polygonSignedSum(poly: Point[]): number {
+  let sum = 0
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i], b = poly[(i + 1) % poly.length]
+    sum += (b.x - a.x) * (b.y + a.y)
+  }
+  return sum
 }
+
+// ─── 스냅 헬퍼 ────────────────────────────────────────────────────────────────
+
+// 폴리곤 위의 가장 가까운 점 + 외향 법선 방향으로 protrude만큼 이동
+function snapToPolygon(px: number, py: number, poly: Point[], protrude: number): Point {
+  let bestIdx = 0, bestD = Infinity
+  for (let i = 0; i < poly.length; i++) {
+    const d = (poly[i].x - px) ** 2 + (poly[i].y - py) ** 2
+    if (d < bestD) { bestD = d; bestIdx = i }
+  }
+  const n = poly.length
+  const p    = poly[bestIdx]
+  const prev = poly[(bestIdx - 1 + n) % n]
+  const next = poly[(bestIdx + 1) % n]
+  const tx = next.x - prev.x, ty = next.y - prev.y
+  const tLen = Math.hypot(tx, ty) || 1
+  return { x: p.x + (-ty / tLen) * protrude, y: p.y + (tx / tLen) * protrude }
+}
+
+// 둥근 사각형 외곽으로 스냅: 모서리는 호 위에, 변은 수직 방향으로 protrude
+// 내부 점일 때는 가까운 변(가로/세로) 중 더 가까운 쪽으로 스냅 — 안쪽 드래그 시 반대편 변으로 점프 방지
+function snapToRoundedRect(
+  px: number, py: number,
+  cx: number, cy: number,
+  halfW: number, halfH: number,
+  cornerR: number,
+  protrude: number,
+): Point {
+  const localX = px - cx, localY = py - cy
+  const sx = Math.sign(localX) || 1
+  const sy = Math.sign(localY) || 1
+  const ax = Math.abs(localX), ay = Math.abs(localY)
+  const innerW = halfW - cornerR
+  const innerH = halfH - cornerR
+
+  const toTop  = (): Point => ({ x: cx + sx * Math.min(ax, innerW), y: cy + sy * (halfH + protrude) })
+  const toSide = (): Point => ({ x: cx + sx * (halfW + protrude), y: cy + sy * Math.min(ay, innerH) })
+
+  // inner rect 내부: 변까지의 거리 비교
+  if (ax <= innerW && ay <= innerH) {
+    return (halfH - ay) <= (halfW - ax) ? toTop() : toSide()
+  }
+  // 상/하 변 연장 영역 (가로 안쪽, 세로는 바깥)
+  if (ax <= innerW) return toTop()
+  // 좌/우 변 연장 영역
+  if (ay <= innerH) return toSide()
+  // 모서리 호 영역: 호 중심에서 반지름 방향
+  const arcCx = innerW, arcCy = innerH
+  const ddx = ax - arcCx, ddy = ay - arcCy
+  const d = Math.hypot(ddx, ddy) || 1
+  const ex = arcCx + (ddx / d) * (cornerR + protrude)
+  const ey = arcCy + (ddy / d) * (cornerR + protrude)
+  return { x: cx + sx * ex, y: cy + sy * ey }
+}
+
+// 타원 외곽 + protrude 방향으로 스냅
+function snapToEllipse(px: number, py: number, cx: number, cy: number, rx: number, ry: number, protrude: number): Point {
+  const angle = Math.atan2(py - cy, px - cx)
+  const cosA = Math.cos(angle), sinA = Math.sin(angle)
+  const r = (rx * ry) / Math.sqrt((ry * cosA) ** 2 + (rx * sinA) ** 2)
+  return { x: cx + (r + protrude) * cosA, y: cy + (r + protrude) * sinA }
+}
+
+// ─── 고리 렌더링 ──────────────────────────────────────────────────────────────
+
+interface HoleOptions {
+  canvas: fabric.Canvas
+  positions: Point[]
+  zoom: number
+  snapFn: (x: number, y: number) => Point
+}
+
+function renderHoleGroups({ canvas, positions, zoom, snapFn }: HoleOptions) {
+  const outerR = mmToScreenPx(3.5) * zoom
+  const innerR = mmToScreenPx(1.5) * zoom
+  const groups: fabric.Group[] = []
+
+  for (const pos of positions) {
+    const outer = new fabric.Circle({
+      left: 0, top: 0, radius: outerR,
+      fill: PRODUCT_BG, stroke: CUT_COLOR, strokeWidth: 1.5,
+      originX: 'center', originY: 'center',
+    })
+    const inner = new fabric.Circle({
+      left: 0, top: 0, radius: innerR,
+      fill: CANVAS_BG, stroke: HOLE_COLOR, strokeWidth: 1.5,
+      originX: 'center', originY: 'center',
+    })
+    const group = new fabric.Group([outer, inner], {
+      left: pos.x, top: pos.y,
+      originX: 'center', originY: 'center',
+      selectable: true,
+      hasControls: false,
+      hasBorders: false,
+      lockRotation: true,
+      lockScalingX: true,
+      lockScalingY: true,
+      hoverCursor: 'grab',
+      moveCursor: 'grabbing',
+    })
+    tag(group, 'hole')
+    groups.push(group)
+
+    const minGap = outerR * 2 + mmToScreenPx(1) * zoom
+
+    group.on('moving', () => {
+      // 칼선에 스냅
+      const snapped = snapFn(group.left!, group.top!)
+      let fx = snapped.x, fy = snapped.y
+
+      // 다른 고리와 최소 간격 유지
+      for (const other of groups) {
+        if (other === group) continue
+        const dist = Math.hypot(fx - other.left!, fy - other.top!)
+        if (dist < minGap && dist > 0) {
+          const ddx = fx - other.left!, ddy = fy - other.top!
+          const d = Math.hypot(ddx, ddy) || 1
+          const pushed = snapFn(other.left! + (ddx / d) * minGap, other.top! + (ddy / d) * minGap)
+          fx = pushed.x; fy = pushed.y
+        }
+      }
+      group.set({ left: fx, top: fy })
+      canvas.renderAll()
+    })
+
+    canvas.add(group)
+  }
+}
+
+// ─── 레이어 순서 정리 ─────────────────────────────────────────────────────────
+
+// z-order: 아래 → 위 순서로 명시. 칼선은 항상 최상위
+const Z_ORDER = ['product-area', 'user-image', 'hole', 'cut-line'] as const
+
+function reorder(canvas: fabric.Canvas) {
+  for (const tag of Z_ORDER) {
+    for (const o of canvas.getObjects()) {
+      if ((o as Tagged)._tag === tag) canvas.bringObjectToFront(o)
+    }
+  }
+  for (const o of canvas.getObjects()) {
+    if ((o as Tagged)._tag === 'cut-line') {
+      o.set({ evented: false, selectable: false })
+    }
+  }
+}
+
+// ─── 메인 컴포넌트 ────────────────────────────────────────────────────────────
 
 export default function FabricCanvas() {
-  const canvasRef = useRef<HTMLCanvasElement>(null)
-  const fabricRef = useRef<fabric.Canvas | null>(null)
+  const canvasRef    = useRef<HTMLCanvasElement>(null)
+  const fabricRef    = useRef<fabric.Canvas | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
-  const [canvasSize, setCanvasSize] = useState({ w: 600, h: 500 })
+  const parsedSvgRef = useRef<ReturnType<typeof parseSVGCutLine>>(null)
 
-  const width = useEditorStore((s) => s.width)
-  const height = useEditorStore((s) => s.height)
-  const cornerRadius = useEditorStore((s) => s.cornerRadius)
-  const cutLineOffset = useEditorStore((s) => s.cutLineOffset)
-  const zoom = useEditorStore((s) => s.zoom)
-  const holeCount = useEditorStore((s) => s.holeCount)
-  const holePosition = useEditorStore((s) => s.holePosition)
-  const frontImageData = useEditorStore((s) => s.frontImageData)
-  const productType = useEditorStore((s) => s.productType)
-  const cutShape = useEditorStore((s) => s.cutShape)
-  const contourSigma = useEditorStore((s) => s.contourSigma)
-  const contourSlices = useEditorStore((s) => s.contourSlices)
-  const contourOffset = useEditorStore((s) => s.contourOffset)
+  const [canvasSize, setCanvasSize] = useState({ w: 0, h: 0 })
 
-  // Initialize canvas (once)
+  const width          = useEditorStore(s => s.width)
+  const height         = useEditorStore(s => s.height)
+  const cornerRadius   = useEditorStore(s => s.cornerRadius)
+  const cutLineOffset  = useEditorStore(s => s.cutLineOffset)
+  const zoom           = useEditorStore(s => s.zoom)
+  const holeCount      = useEditorStore(s => s.holeCount)
+  const holePosition   = useEditorStore(s => s.holePosition)
+  const frontImageData = useEditorStore(s => s.frontImageData)
+  const productType    = useEditorStore(s => s.productType)
+  const cutShape       = useEditorStore(s => s.cutShape)
+  const cutLineSvgData = useEditorStore(s => s.cutLineSvgData)
+  const setCutLinePolygon = useEditorStore(s => s.setCutLinePolygon)
+
+  // ── 캔버스 초기화 ────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!canvasRef.current) return
-
     const container = containerRef.current
-    const initW = container ? container.clientWidth : 400
-    const initH = container ? container.clientHeight : 400
+    const initW = container?.clientWidth ?? 0
+    const initH = container?.clientHeight ?? 0
+
     const canvas = new fabric.Canvas(canvasRef.current, {
-      width: initW,
-      height: initH,
+      width: Math.max(initW, 1), height: Math.max(initH, 1),
       backgroundColor: CANVAS_BG,
-      selection: true,
-      preserveObjectStacking: true, // z-order 유지, 선택해도 순서 안 바뀜
+      selection: false,
+      preserveObjectStacking: true,
     })
-    setCanvasSize({ w: initW, h: initH })
+    if (initW > 0 && initH > 0) setCanvasSize({ w: initW, h: initH })
     fabricRef.current = canvas
     setCanvasRef(canvas)
 
-    // 고리 우선 선택: 클릭 위치 근처에 고리가 있으면 강제 선택
-    canvas.on('mouse:down', (opt) => {
-      const pointer = canvas.getViewportPoint(opt.e)
-      const holeObjs = canvas.getObjects().filter(
-        o => (o as TaggedObject)._editorType === 'hole'
-      )
-      for (const hole of holeObjs) {
-        const dist = Math.hypot(pointer.x - hole.left!, pointer.y - hole.top!)
-        if (dist < 25) { // 고리 반경 내 클릭
-          canvas.setActiveObject(hole)
-          canvas.renderAll()
-          return
-        }
-      }
+    canvas.on('mouse:wheel', (opt) => {
+      opt.e.preventDefault()
+      opt.e.stopPropagation()
+      const curr = useEditorStore.getState().zoom
+      const delta = opt.e.deltaY > 0 ? -0.05 : 0.05
+      useEditorStore.getState().setZoom(Math.min(3, Math.max(0.3, curr + delta)))
     })
 
-    // Zoom with mouse wheel
-    canvas.on('mouse:wheel', (opt: fabric.TEvent<WheelEvent>) => {
-      const e = opt.e
-      e.preventDefault()
-      e.stopPropagation()
-      const currentZoom = useEditorStore.getState().zoom
-      const delta = e.deltaY > 0 ? -0.05 : 0.05
-      useEditorStore.getState().setZoom(Math.min(3, Math.max(0.3, currentZoom + delta)))
-    })
-
-    return () => {
-      canvas.dispose()
-      fabricRef.current = null
-      setCanvasRef(null)
-    }
+    return () => { canvas.dispose(); fabricRef.current = null; setCanvasRef(null) }
   }, [])
 
-  // Resize canvas to fit container
+  // ── 컨테이너 리사이즈 ────────────────────────────────────────────────────────
   useEffect(() => {
     const canvas = fabricRef.current
     const container = containerRef.current
     if (!canvas || !container) return
-
     const resize = () => {
-      const rect = container.getBoundingClientRect()
-      if (rect.width > 0 && rect.height > 0) {
-        canvas.setDimensions({ width: rect.width, height: rect.height })
-        setCanvasSize({ w: rect.width, h: rect.height })
-      }
+      const { width: w, height: h } = container.getBoundingClientRect()
+      if (w > 0 && h > 0) { canvas.setDimensions({ width: w, height: h }); setCanvasSize({ w, h }) }
     }
-
     resize()
-    const observer = new ResizeObserver(resize)
-    observer.observe(container)
-    return () => observer.disconnect()
+    const obs = new ResizeObserver(resize)
+    obs.observe(container)
+    return () => obs.disconnect()
   }, [])
 
-  // Draw product area + cut line (redraws on any option or canvas size change)
+  // ── SVG 파싱 캐시 (cutLineSvgData 바뀔 때만 재파싱) ─────────────────────────
+  useEffect(() => {
+    if (!cutLineSvgData) { parsedSvgRef.current = null; return }
+    parsedSvgRef.current = parseSVGCutLine(cutLineSvgData)
+  }, [cutLineSvgData])
+
+  // ── 제품 영역 + 칼선 + 고리 렌더링 ──────────────────────────────────────────
   useEffect(() => {
     const canvas = fabricRef.current
     if (!canvas) return
+    if (canvasSize.w <= 0 || canvasSize.h <= 0) return
 
-    removeByType(canvas, 'product-area', 'cut-line', 'hole')
+    removeByTag(canvas, 'product-area', 'cut-line', 'hole')
+    setCutLinePolygon(null)
 
-    const productW = mmToScreenPx(width)
-    const productH = mmToScreenPx(height)
-    const cutOffset = mmToScreenPx(cutLineOffset)
-    const radiusPx = mmToScreenPx(cornerRadius)
+    const cx  = canvasSize.w / 2
+    const cy  = canvasSize.h / 2
+    const pW  = mmToScreenPx(width) * zoom
+    const pH  = mmToScreenPx(height) * zoom
+    const off = mmToScreenPx(cutLineOffset) * zoom
+    const rad = mmToScreenPx(cornerRadius) * zoom
 
-    const cx = canvasSize.w / 2
-    const cy = canvasSize.h / 2
-
-    const pW = productW * zoom
-    const pH = productH * zoom
+    const needHoles = holeCount > 0 && (productType === 'keyring' || productType === 'corolot')
 
     if (cutShape === 'rectangle') {
-      // ── 사각형 모드: 사각 라운드 칼선 ──
-      const productRect = new fabric.Rect({
+      // 제품 영역
+      const bg = new fabric.Rect({
         left: cx - pW / 2, top: cy - pH / 2, width: pW, height: pH,
-        fill: PRODUCT_BG, rx: radiusPx * zoom, ry: radiusPx * zoom,
+        fill: PRODUCT_BG, rx: rad, ry: rad,
         selectable: false, evented: false,
         shadow: new fabric.Shadow({ color: 'rgba(0,0,0,0.12)', blur: 16, offsetX: 0, offsetY: 4 }),
       })
-      tagObject(productRect, 'product-area')
-      canvas.add(productRect)
-      canvas.sendObjectToBack(productRect)
+      tag(bg, 'product-area')
+      canvas.add(bg)
 
-      const clW = (productW + cutOffset * 2) * zoom
-      const clH = (productH + cutOffset * 2) * zoom
-      const cutLine = new fabric.Rect({
+      // 칼선
+      const clW = pW + off * 2, clH = pH + off * 2
+      const cl = new fabric.Rect({
         left: cx - clW / 2, top: cy - clH / 2, width: clW, height: clH,
-        fill: 'transparent', stroke: CUT_LINE_COLOR, strokeWidth: 1.5,
-        rx: (radiusPx + cutOffset) * zoom, ry: (radiusPx + cutOffset) * zoom,
+        fill: 'transparent', stroke: CUT_COLOR, strokeWidth: 1.5,
+        rx: rad + off, ry: rad + off,
         selectable: false, evented: false,
       })
-      tagObject(cutLine, 'cut-line')
-      canvas.add(cutLine)
-      canvas.sendObjectToBack(cutLine)
-      canvas.bringObjectForward(productRect)
+      tag(cl, 'cut-line')
+      canvas.add(cl)
+
+      // 고리
+      if (needHoles) {
+        const halfW = clW / 2, halfH = clH / 2
+        const protrude = mmToScreenPx(3.5) * zoom * 0.4
+        const snapFn = (px: number, py: number) => snapToRoundedRect(px, py, cx, cy, halfW, halfH, rad + off, protrude)
+        const positions = holePositions(cx, cy, halfW, halfH, holeCount, holePosition, protrude, rad + off)
+        renderHoleGroups({ canvas, positions, zoom, snapFn })
+      }
 
     } else if (cutShape === 'circle') {
-      // ── 원형 모드: 타원 칼선 ──
-      const rx = pW / 2
-      const ry = pH / 2
-
-      // 제품 영역 (타원)
-      const productEllipse = new fabric.Ellipse({
+      const rx = pW / 2, ry = pH / 2
+      const bg = new fabric.Ellipse({
         left: cx - rx, top: cy - ry, rx, ry,
         fill: PRODUCT_BG, selectable: false, evented: false,
         shadow: new fabric.Shadow({ color: 'rgba(0,0,0,0.12)', blur: 16, offsetX: 0, offsetY: 4 }),
       })
-      tagObject(productEllipse, 'product-area')
-      canvas.add(productEllipse)
-      canvas.sendObjectToBack(productEllipse)
+      tag(bg, 'product-area')
+      canvas.add(bg)
 
-      // 칼선 (타원 + 오프셋)
-      const crx = rx + cutOffset * zoom
-      const cry = ry + cutOffset * zoom
-      const cutEllipse = new fabric.Ellipse({
+      const crx = rx + off, cry = ry + off
+      const cl = new fabric.Ellipse({
         left: cx - crx, top: cy - cry, rx: crx, ry: cry,
-        fill: 'transparent', stroke: CUT_LINE_COLOR, strokeWidth: 1.5,
+        fill: 'transparent', stroke: CUT_COLOR, strokeWidth: 1.5,
         selectable: false, evented: false,
       })
-      tagObject(cutEllipse, 'cut-line')
-      canvas.add(cutEllipse)
-      canvas.sendObjectToBack(cutEllipse)
-      canvas.bringObjectForward(productEllipse)
+      tag(cl, 'cut-line')
+      canvas.add(cl)
+
+      if (needHoles) {
+        const protrude = mmToScreenPx(3.5) * zoom * 0.4
+        const snapFn = (px: number, py: number) => snapToEllipse(px, py, cx, cy, crx, cry, protrude)
+        const positions = ellipseHolePositions(cx, cy, crx, cry, holeCount, holePosition, protrude)
+        renderHoleGroups({ canvas, positions, zoom, snapFn })
+      }
 
     } else {
-      // ── 자유형 모드: 칼선 없음 (이미지 로드 시 자동 생성) ──
-      // 제품 영역만 표시 (사각 배경)
-      const productRect = new fabric.Rect({
-        left: cx - pW / 2, top: cy - pH / 2, width: pW, height: pH,
+      // 자유형
+      if (!cutLineSvgData || !parsedSvgRef.current) {
+        canvas.renderAll()
+        return
+      }
+      const parsed = parsedSvgRef.current
+      let screenPoly = svgPolyToScreen(parsed.polygon, parsed.bbox, pW, pH, cx, cy)
+      // 폴리곤 winding을 CCW(시각적)로 정규화 → normal `(-ty, tx)`가 항상 outward 가리킴
+      if (polygonSignedSum(screenPoly) < 0) screenPoly = screenPoly.slice().reverse()
+
+      // 제품 영역
+      const bg = new fabric.Polygon(screenPoly, {
         fill: PRODUCT_BG, selectable: false, evented: false,
         shadow: new fabric.Shadow({ color: 'rgba(0,0,0,0.12)', blur: 16, offsetX: 0, offsetY: 4 }),
       })
-      tagObject(productRect, 'product-area')
-      canvas.add(productRect)
-      canvas.sendObjectToBack(productRect)
-    }
+      tag(bg, 'product-area')
+      canvas.add(bg)
 
-    // ── 고리 (Ring tabs) ──
-    if (holeCount > 0 && (productType === 'keyring' || productType === 'corolot')) {
-      const tabOuterR = mmToScreenPx(3.5) * zoom
-      const tabInnerR = mmToScreenPx(1.5) * zoom
-      // 칼선 외곽 기준
-      const halfW = cutShape === 'circle'
-        ? (pW / 2 + cutOffset * zoom)
-        : ((productW + cutOffset * 2) * zoom) / 2
-      const halfH = cutShape === 'circle'
-        ? (pH / 2 + cutOffset * zoom)
-        : ((productH + cutOffset * 2) * zoom) / 2
-      const protrude = tabOuterR * 0.4
+      // 칼선 (오프셋 폴리곤) — Clipper2가 self-intersection / holes 자동 처리
+      const cutPoly = offsetParallel(screenPoly, off)
+      const cl = new fabric.Polygon(cutPoly, {
+        fill: 'transparent', stroke: CUT_COLOR, strokeWidth: 1.5,
+        selectable: false, evented: false,
+      })
+      tag(cl, 'cut-line')
+      canvas.add(cl)
 
-      // 고리 초기 위치 (사각/원형: 계산, 자유형: snapToEdge 사용)
-      const initPos = (targetX: number, targetY: number) => {
-        // 자유형은 칼선 포인트가 있으면 그 위에 스냅
-        if (cutShape === 'freeform') {
-          const pts = useEditorStore.getState().freeformCutLinePoints
-          if (pts && pts.length > 2) {
-            let bestIdx = 0, bestD = Infinity
-            for (let i = 0; i < pts.length; i++) {
-              const d = (pts[i].x - targetX) ** 2 + (pts[i].y - targetY) ** 2
-              if (d < bestD) { bestD = d; bestIdx = i }
-            }
-            const p = pts[bestIdx]
-            const prev = pts[(bestIdx - 1 + pts.length) % pts.length]
-            const next = pts[(bestIdx + 1) % pts.length]
-            const tx = next.x - prev.x, ty = next.y - prev.y
-            const tLen = Math.hypot(tx, ty) || 1
-            return { x: p.x + (-ty / tLen) * protrude, y: p.y + (tx / tLen) * protrude }
-          }
-        }
-        return { x: targetX, y: targetY }
-      }
+      // 칼선 폴리곤 저장 (고리 스냅 + 외부 참조용)
+      const sampled = resampleEvenly(cutPoly, 300)
+      setCutLinePolygon(sampled)
 
-      const positions: { x: number; y: number }[] = []
-      if (holeCount === 1) {
-        if (holePosition === 'top')    positions.push(initPos(cx, cy - halfH - protrude))
-        if (holePosition === 'bottom') positions.push(initPos(cx, cy + halfH + protrude))
-        if (holePosition === 'left')   positions.push(initPos(cx - halfW - protrude, cy))
-        if (holePosition === 'right')  positions.push(initPos(cx + halfW + protrude, cy))
-      } else if (holeCount === 2) {
-        const spacing = (productW * zoom) * 0.3
-        if (holePosition === 'top') {
-          positions.push(initPos(cx - spacing, cy - halfH - protrude))
-          positions.push(initPos(cx + spacing, cy - halfH - protrude))
-        }
-        if (holePosition === 'bottom') {
-          positions.push(initPos(cx - spacing, cy + halfH + protrude))
-          positions.push(initPos(cx + spacing, cy + halfH + protrude))
-        }
-        if (holePosition === 'left') {
-          positions.push(initPos(cx - halfW - protrude, cy - spacing))
-          positions.push(initPos(cx - halfW - protrude, cy + spacing))
-        }
-        if (holePosition === 'right') {
-          positions.push(initPos(cx + halfW + protrude, cy - spacing))
-          positions.push(initPos(cx + halfW + protrude, cy + spacing))
-        }
-      }
-
-      // 칼선 외곽에 스냅하는 함수 (cutShape에 따라 분기)
-      const snapToEdge = (dragX: number, dragY: number) => {
-        if (cutShape === 'freeform') {
-          // 자유형: 저장된 칼선 포인트 중 가장 가까운 점 + 법선 방향 protrude
-          const pts = useEditorStore.getState().freeformCutLinePoints
-          if (pts && pts.length > 2) {
-            let bestIdx = 0, bestD = Infinity
-            for (let i = 0; i < pts.length; i++) {
-              const d = (pts[i].x - dragX) ** 2 + (pts[i].y - dragY) ** 2
-              if (d < bestD) { bestD = d; bestIdx = i }
-            }
-            const p = pts[bestIdx]
-            const prev = pts[(bestIdx - 1 + pts.length) % pts.length]
-            const next = pts[(bestIdx + 1) % pts.length]
-            // 법선 방향
-            const tx = next.x - prev.x, ty = next.y - prev.y
-            const tLen = Math.hypot(tx, ty) || 1
-            const nx = -ty / tLen, ny = tx / tLen
-            return { x: p.x + nx * protrude, y: p.y + ny * protrude }
-          }
-        }
-
-        const dx = dragX - cx, dy = dragY - cy
-        const angle = Math.atan2(dy, dx)
-        const cosA = Math.cos(angle), sinA = Math.sin(angle)
-
-        if (cutShape === 'circle') {
-          const r = (halfW * halfH) / Math.sqrt((halfH * cosA) ** 2 + (halfW * sinA) ** 2)
-          return { x: cx + (r + protrude) * cosA, y: cy + (r + protrude) * sinA }
-        } else {
-          const tX = cosA !== 0 ? halfW / Math.abs(cosA) : Infinity
-          const tY = sinA !== 0 ? halfH / Math.abs(sinA) : Infinity
-          const t = Math.min(tX, tY)
-          return { x: cx + t * cosA + protrude * cosA, y: cy + t * sinA + protrude * sinA }
-        }
-      }
-
-      // 각 고리 렌더링 (드래그 가능한 그룹)
-      const minGap = mmToScreenPx(1) * zoom  // 최소 1mm 간격
-      const holeGroups: fabric.Group[] = []
-
-      for (const pos of positions) {
-        const tabOuter = new fabric.Circle({
-          left: 0, top: 0, radius: tabOuterR,
-          fill: PRODUCT_BG, stroke: CUT_LINE_COLOR, strokeWidth: 1.5,
-          originX: 'center', originY: 'center',
-        })
-        const tabInner = new fabric.Circle({
-          left: 0, top: 0, radius: tabInnerR,
-          fill: CANVAS_BG, stroke: HOLE_COLOR, strokeWidth: 1.5,
-          originX: 'center', originY: 'center',
-        })
-
-        const holeGroup = new fabric.Group([tabOuter, tabInner], {
-          left: pos.x, top: pos.y,
-          originX: 'center', originY: 'center',
-          selectable: true, hasControls: false, hasBorders: false,
-          lockRotation: true, lockScalingX: true, lockScalingY: true,
-          hoverCursor: 'grab', moveCursor: 'grabbing',
-          perPixelTargetFind: false, // 전체 bounding box 클릭 가능
-        })
-        tagObject(holeGroup, 'hole')
-        holeGroups.push(holeGroup)
-
-        // 드래그 시 칼선 스냅 + 다른 고리와 최소 1mm 간격 유지
-        holeGroup.on('moving', () => {
-          const snapped = snapToEdge(holeGroup.left!, holeGroup.top!)
-          let finalX = snapped.x, finalY = snapped.y
-
-          // 다른 고리와 거리 체크
-          for (const other of holeGroups) {
-            if (other === holeGroup) continue
-            const dist = Math.hypot(finalX - other.left!, finalY - other.top!)
-            const minDist = tabOuterR * 2 + minGap
-            if (dist < minDist && dist > 0) {
-              // 너무 가까우면 밀어냄
-              const dx = finalX - other.left!
-              const dy = finalY - other.top!
-              const d = Math.hypot(dx, dy) || 1
-              finalX = other.left! + (dx / d) * minDist
-              finalY = other.top! + (dy / d) * minDist
-              // 밀어낸 위치를 다시 칼선에 스냅
-              const reSnap = snapToEdge(finalX, finalY)
-              finalX = reSnap.x
-              finalY = reSnap.y
-            }
-          }
-
-          holeGroup.set({ left: finalX, top: finalY })
-          canvas.renderAll()
-        })
-
-        canvas.add(holeGroup)
+      if (needHoles) {
+        const protrude = mmToScreenPx(3.5) * zoom * 0.4
+        const snapFn = (px: number, py: number) => snapToPolygon(px, py, sampled, protrude)
+        // 자유형: 칼선 폴리곤 위에 균등 배치
+        const positions = freeformHolePositions(sampled, holeCount, protrude)
+        renderHoleGroups({ canvas, positions, zoom, snapFn })
       }
     }
 
+    reorder(canvas)
     canvas.renderAll()
-  }, [width, height, cornerRadius, cutLineOffset, zoom, holeCount, holePosition, productType, cutShape, canvasSize])
+  }, [
+    width, height, cornerRadius, cutLineOffset, zoom,
+    holeCount, holePosition, productType, cutShape, cutLineSvgData, canvasSize,
+  ])
 
-  // Load front image onto canvas + auto contour for PNG with transparency
+  // ── 이미지 배치 ──────────────────────────────────────────────────────────────
   useEffect(() => {
     const canvas = fabricRef.current
     if (!canvas) return
+    if (canvasSize.w <= 0 || canvasSize.h <= 0) return
+    removeByTag(canvas, 'user-image')
 
-    removeByType(canvas, 'user-image', 'auto-contour')
-
-    if (!frontImageData) {
-      canvas.renderAll()
-      return
-    }
-
-    const productW = mmToScreenPx(width)
-    const productH = mmToScreenPx(height)
-    const cutOffset = mmToScreenPx(cutLineOffset)
+    if (!frontImageData) { canvas.renderAll(); return }
 
     const imgEl = new Image()
     imgEl.onload = () => {
-      // onload 시점에서 다시 한번 이전 칼선 확실히 제거 (비동기 타이밍 문제 방지)
-      removeByType(canvas, 'user-image', 'auto-contour')
+      removeByTag(canvas, 'user-image')
+      const pW  = mmToScreenPx(width) * zoom
+      const pH  = mmToScreenPx(height) * zoom
+      const scale = Math.min(pW / imgEl.width, pH / imgEl.height) * 0.9
       const fImg = new fabric.FabricImage(imgEl, {
-        selectable: true,
-        centeredScaling: true,
-        centeredRotation: true,
+        left: canvasSize.w / 2 - (imgEl.width * scale) / 2,
+        top:  canvasSize.h / 2 - (imgEl.height * scale) / 2,
+        selectable: true, centeredScaling: true, centeredRotation: true,
       })
-
-      const scaleX = (productW * zoom) / imgEl.width
-      const scaleY = (productH * zoom) / imgEl.height
-      const scale = Math.min(scaleX, scaleY) * 0.9
       fImg.scale(scale)
-
-      const imgLeft = canvasSize.w / 2 - (imgEl.width * scale) / 2
-      const imgTop = canvasSize.h / 2 - (imgEl.height * scale) / 2
-
-      fImg.set({ left: imgLeft, top: imgTop })
-      tagObject(fImg, 'user-image')
-
+      tag(fImg, 'user-image')
       canvas.add(fImg)
+      reorder(canvas)
       canvas.discardActiveObject()
-
-      // PNG 투명 영역 감지 → 자동 외곽선 생성
-      const hasTrans = hasTransparency(imgEl)
-      if (hasTrans) {
-        const pxPerMm = mmToScreenPx(1)
-        const contourData = extractContour(imgEl, scale, contourOffset, pxPerMm, contourSigma, contourSlices)
-
-        if (contourData) {
-          // 원형/타원형 감지 시 Fabric 기본 도형 사용 (좌표 정확)
-          const isCircular = contourData.outline.length === 4 &&
-            Math.abs(contourData.outline[0].x - contourData.outline[2].x) < 2 &&
-            Math.abs(contourData.outline[1].y - contourData.outline[3].y) < 2
-
-          if (isCircular) {
-            const pts = contourData.outline
-            // 4포인트: top, right, bottom, left → 중심, 반지름 추출
-            const ocx = (pts[1].x + pts[3].x) / 2
-            const ocy = (pts[0].y + pts[2].y) / 2
-            const orx = (pts[1].x - pts[3].x) / 2
-            const ory = (pts[2].y - pts[0].y) / 2
-
-            const cpts = contourData.cutLine
-            const ccx = (cpts[1].x + cpts[3].x) / 2
-            const ccy = (cpts[0].y + cpts[2].y) / 2
-            const crx = (cpts[1].x - cpts[3].x) / 2
-            const cry = (cpts[2].y - cpts[0].y) / 2
-
-            // 칼선 (빨간 실선)
-            const cutEllipse = new fabric.Ellipse({
-              left: imgLeft + ccx - crx,
-              top: imgTop + ccy - cry,
-              rx: crx,
-              ry: cry,
-              fill: 'transparent',
-              stroke: CUT_LINE_COLOR,
-              strokeWidth: 1.5,
-              selectable: false,
-              evented: false,
-            })
-            tagObject(cutEllipse, 'auto-contour')
-            canvas.add(cutEllipse)
-          } else {
-            // 비정형: 개별 Line으로 렌더링 (좌표 정확, 최상단 보장)
-            const drawLines = (pts: { x: number; y: number }[], stroke: string, sw: number) => {
-              for (let i = 0; i < pts.length; i++) {
-                const a = pts[i], b = pts[(i + 1) % pts.length]
-                const line = new fabric.Line(
-                  [a.x + imgLeft, a.y + imgTop, b.x + imgLeft, b.y + imgTop],
-                  { stroke, strokeWidth: sw, selectable: false, evented: false }
-                )
-                tagObject(line, 'auto-contour')
-                canvas.add(line)
-              }
-            }
-
-            drawLines(contourData.cutLine, CUT_LINE_COLOR, 1.5)
-
-            // 포인트 수 저장 (개발용 디버그)
-            useEditorStore.getState().setContourPointCount({
-              outline: contourData.outline.length,
-              cutLine: contourData.cutLine.length,
-            })
-
-            // 자유형 칼선 포인트를 store에 저장 (고리 스냅용, 절대 좌표)
-            const absCutLine = contourData.cutLine.map(p => ({ x: p.x + imgLeft, y: p.y + imgTop }))
-            useEditorStore.getState().setFreeformCutLinePoints(absCutLine)
-
-            // 칼선 bounding box → 제품 사이즈 자동 확대
-            // cutLine 좌표는 화면 스케일 적용된 이미지 내부 좌표
-            // 화면px → mm: px / (mmToScreenPx(1) * zoom)
-            let clMinX = Infinity, clMinY = Infinity, clMaxX = -Infinity, clMaxY = -Infinity
-            for (const p of contourData.cutLine) {
-              if (p.x < clMinX) clMinX = p.x
-              if (p.y < clMinY) clMinY = p.y
-              if (p.x > clMaxX) clMaxX = p.x
-              if (p.y > clMaxY) clMaxY = p.y
-            }
-            const screenToMm = 1 / (mmToScreenPx(1) * zoom)
-            const cutWMm = (clMaxX - clMinX) * screenToMm
-            const cutHMm = (clMaxY - clMinY) * screenToMm
-            const store = useEditorStore.getState()
-            if (cutWMm > store.width || cutHMm > store.height) {
-              store.setSize(
-                Math.max(store.width, Math.ceil(cutWMm + 1)),
-                Math.max(store.height, Math.ceil(cutHMm + 1)),
-              )
-            }
-
-            // 기존 고리를 칼선 위로 재배치
-            const holeObjs = canvas.getObjects().filter(
-              o => (o as TaggedObject)._editorType === 'hole'
-            )
-            if (holeObjs.length > 0 && absCutLine.length > 2) {
-              const tabOuterR2 = mmToScreenPx(3.5) * zoom
-              const protrude2 = tabOuterR2 * 0.4
-              // 고리 수에 따라 균등 분배
-              const step = Math.floor(absCutLine.length / (holeObjs.length + 1))
-              holeObjs.forEach((hole, idx) => {
-                const ptIdx = step * (idx + 1)
-                const p = absCutLine[ptIdx % absCutLine.length]
-                const prev = absCutLine[(ptIdx - 1 + absCutLine.length) % absCutLine.length]
-                const next = absCutLine[(ptIdx + 1) % absCutLine.length]
-                const tx = next.x - prev.x, ty = next.y - prev.y
-                const tLen = Math.hypot(tx, ty) || 1
-                hole.set({
-                  left: p.x + (-ty / tLen) * protrude2,
-                  top: p.y + (tx / tLen) * protrude2,
-                })
-              })
-            }
-          }
-        }
-      }
-
-      // 레이어 순서 강제 + 고리가 최상단
-      for (const o of canvas.getObjects()) {
-        const t = (o as TaggedObject)._editorType
-        if (t === 'product-area') canvas.sendObjectToBack(o)
-      }
-      for (const o of canvas.getObjects()) {
-        const t = (o as TaggedObject)._editorType
-        if (t === 'auto-contour') canvas.bringObjectToFront(o)
-      }
-      for (const o of canvas.getObjects()) {
-        const t = (o as TaggedObject)._editorType
-        if (t === 'hole') canvas.bringObjectToFront(o)
-      }
-      // 칼선 Line이 고리 드래그를 차단하지 않도록
-      for (const o of canvas.getObjects()) {
-        const t = (o as TaggedObject)._editorType
-        if (t === 'auto-contour') {
-          o.set({ evented: false, selectable: false, hoverCursor: 'default' })
-        }
-      }
-
       canvas.renderAll()
     }
     imgEl.src = frontImageData
-  }, [frontImageData, width, height, zoom, canvasSize, cutLineOffset, contourSigma, contourSlices, contourOffset])
+  }, [frontImageData, width, height, zoom, canvasSize])
 
   return (
     <div ref={containerRef} className="w-full h-full relative overflow-hidden">
       <canvas ref={canvasRef} className="absolute inset-0" />
     </div>
   )
+}
+
+// ─── 고리 초기 위치 계산 ─────────────────────────────────────────────────────
+
+function holePositions(
+  cx: number, cy: number,
+  halfW: number, halfH: number,
+  count: number, position: string, protrude: number,
+  cornerR: number = 0,
+): Point[] {
+  // 평면 변 영역 절반(코너 호 제외) — 2개 고리 spacing은 이 안에서
+  const flatHalfH = Math.max(halfH - cornerR, 0)
+  const flatHalfW = Math.max(halfW - cornerR, 0)
+  const spaceH = flatHalfW * 0.5  // top/bottom일 때
+  const spaceV = flatHalfH * 0.5  // left/right일 때
+  const pts: Point[] = []
+  if (count === 1) {
+    if (position === 'top')    pts.push({ x: cx,                    y: cy - halfH - protrude })
+    if (position === 'bottom') pts.push({ x: cx,                    y: cy + halfH + protrude })
+    if (position === 'left')   pts.push({ x: cx - halfW - protrude, y: cy })
+    if (position === 'right')  pts.push({ x: cx + halfW + protrude, y: cy })
+  } else if (count === 2) {
+    if (position === 'top') {
+      pts.push({ x: cx - spaceH, y: cy - halfH - protrude })
+      pts.push({ x: cx + spaceH, y: cy - halfH - protrude })
+    } else if (position === 'bottom') {
+      pts.push({ x: cx - spaceH, y: cy + halfH + protrude })
+      pts.push({ x: cx + spaceH, y: cy + halfH + protrude })
+    } else if (position === 'left') {
+      pts.push({ x: cx - halfW - protrude, y: cy - spaceV })
+      pts.push({ x: cx - halfW - protrude, y: cy + spaceV })
+    } else if (position === 'right') {
+      pts.push({ x: cx + halfW + protrude, y: cy - spaceV })
+      pts.push({ x: cx + halfW + protrude, y: cy + spaceV })
+    }
+  }
+  return pts
+}
+
+// 타원: 각도 기반 고리 초기 위치 (직사각형 로직으로는 타원 경계를 벗어남)
+function ellipseHolePositions(
+  cx: number, cy: number,
+  rx: number, ry: number,
+  count: number, position: string, protrude: number,
+): Point[] {
+  const centerAngle: Record<string, number> = {
+    top:    -Math.PI / 2,
+    bottom:  Math.PI / 2,
+    left:    Math.PI,
+    right:   0,
+  }
+  const base = centerAngle[position] ?? -Math.PI / 2
+  const angles = count === 1 ? [base] : [base - Math.PI / 6, base + Math.PI / 6]
+  return angles.map(a => {
+    const cosA = Math.cos(a), sinA = Math.sin(a)
+    const r = (rx * ry) / Math.sqrt((ry * cosA) ** 2 + (rx * sinA) ** 2)
+    return { x: cx + (r + protrude) * cosA, y: cy + (r + protrude) * sinA }
+  })
+}
+
+// 자유형: 칼선 폴리곤 위에 균등 간격으로 고리 배치
+function freeformHolePositions(poly: Point[], count: number, protrude: number): Point[] {
+  if (!poly.length || count === 0) return []
+  const step = Math.floor(poly.length / (count + 1))
+  return Array.from({ length: count }, (_, i) => {
+    const n = poly.length
+    const idx = step * (i + 1)
+    const p    = poly[idx % n]
+    const prev = poly[(idx - 1 + n) % n]
+    const next = poly[(idx + 1) % n]
+    const tx = next.x - prev.x, ty = next.y - prev.y
+    const tLen = Math.hypot(tx, ty) || 1
+    return { x: p.x + (-ty / tLen) * protrude, y: p.y + (tx / tLen) * protrude }
+  })
 }

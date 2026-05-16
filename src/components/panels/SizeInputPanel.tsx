@@ -42,7 +42,7 @@ export default function SizeInputPanel({ sizeConstraint }: Props) {
             onChange={(e) => handleWidth(e.target.value)}
             min={sizeConstraint.minWidth}
             max={sizeConstraint.maxWidth}
-            className="w-full mt-1 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:border-blue-400"
+            className="w-full mt-1 px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:border-blue-400"
           />
         </div>
         <span className="text-gray-400 mt-5">×</span>
@@ -54,7 +54,7 @@ export default function SizeInputPanel({ sizeConstraint }: Props) {
             onChange={(e) => handleHeight(e.target.value)}
             min={sizeConstraint.minHeight}
             max={sizeConstraint.maxHeight}
-            className="w-full mt-1 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:border-blue-400"
+            className="w-full mt-1 px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:border-blue-400"
           />
         </div>
       </div>

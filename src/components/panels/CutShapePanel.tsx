@@ -4,7 +4,7 @@ import type { CutShape } from '@/stores/editorStore'
 const SHAPES: { value: CutShape; label: string; desc: string }[] = [
   { value: 'rectangle', label: '사각형', desc: '사각 라운드 칼선' },
   { value: 'circle', label: '원형', desc: '원형/타원형 칼선' },
-  { value: 'freeform', label: '자유형', desc: 'PNG 외곽 자동 칼선' },
+  { value: 'freeform', label: '자유형', desc: 'SVG 칼선 파일 업로드' },
 ]
 
 export default function CutShapePanel() {
@@ -19,7 +19,7 @@ export default function CutShapePanel() {
           <button
             key={s.value}
             onClick={() => setCutShape(s.value)}
-            className={`flex-1 py-2 px-1 text-xs rounded-lg border cursor-pointer transition-colors ${
+            className={`flex-1 py-2 px-1 text-xs rounded-md border cursor-pointer transition-colors ${
               cutShape === s.value
                 ? 'border-red-500 bg-red-50 text-red-700 font-medium'
                 : 'border-gray-200 text-gray-500 hover:border-gray-300'

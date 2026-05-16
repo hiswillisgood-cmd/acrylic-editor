@@ -1,11 +1,12 @@
-{
+﻿{
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "acrylic-editor-dev",
-      "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev"],
-      "port": 5173
+      "name": "acrylic-editor",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["vite", "--port", "3002"],
+      "port": 3002,
+      "autoPort": false
     }
   ]
 }

@@ -22,7 +22,7 @@ export default function HoleConfigPanel() {
       </p>
 
       {/* 고리 크기 안내 */}
-      <div className="flex items-center gap-3 mb-4 p-3 bg-gray-50 rounded-lg">
+      <div className="flex items-center gap-3 mb-4 p-3 bg-gray-50 rounded-md">
         <div className="flex items-center justify-center w-10 h-10 rounded-full border-2 border-dashed border-red-300 bg-white">
           <div className="w-4 h-4 rounded-full bg-gray-200 border border-gray-300" />
         </div>
@@ -39,7 +39,7 @@ export default function HoleConfigPanel() {
           <button
             key={n}
             onClick={() => setHoleCount(n)}
-            className={`flex-1 py-2 text-sm rounded-lg border cursor-pointer transition-colors ${
+            className={`flex-1 py-2 text-sm rounded-md border cursor-pointer transition-colors ${
               holeCount === n
                 ? 'border-blue-500 bg-blue-50 text-blue-700 font-medium'
                 : 'border-gray-200 text-gray-500 hover:border-gray-300'
@@ -59,7 +59,7 @@ export default function HoleConfigPanel() {
               <button
                 key={pos.value}
                 onClick={() => setHolePosition(pos.value)}
-                className={`flex-1 py-2 text-xs rounded-lg border cursor-pointer transition-colors ${
+                className={`flex-1 py-2 text-xs rounded-md border cursor-pointer transition-colors ${
                   holePosition === pos.value
                     ? 'border-blue-500 bg-blue-50 text-blue-700 font-medium'
                     : 'border-gray-200 text-gray-500 hover:border-gray-300'

@@ -14,7 +14,7 @@ export default function Home() {
           <button
             key={product.type}
             onClick={() => navigate(`/editor/${product.type}`)}
-            className="group flex flex-col items-center gap-4 p-8 bg-white rounded-2xl shadow-sm border border-gray-200 hover:border-red-400 hover:shadow-lg transition-all cursor-pointer"
+            className="group flex flex-col items-center gap-4 p-8 bg-white rounded-lg shadow-sm border border-gray-200 hover:border-red-400 hover:shadow-lg transition-all cursor-pointer"
           >
             <span className="text-5xl group-hover:scale-110 transition-transform">
               {product.icon}
