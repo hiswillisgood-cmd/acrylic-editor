@@ -10,12 +10,13 @@ import CornerRadiusPanel from '@/components/panels/CornerRadiusPanel'
 import HoleConfigPanel from '@/components/panels/HoleConfigPanel'
 import BasePlatePanel from '@/components/panels/BasePlatePanel'
 import ThicknessPanel from '@/components/panels/ThicknessPanel'
+import LaminatePanel from '@/components/panels/LaminatePanel'
 import SideSelectPanel from '@/components/panels/SideSelectPanel'
 
 interface Props { productType: ProductType }
 
 function Section({ children }: { children: ReactNode }) {
-  return <div style={{ padding: '22px 28px', borderBottom: '1px solid #e5e7eb' }}>{children}</div>
+  return <div style={{ padding: '2px 28px', borderBottom: '1px solid #e5e7eb' }}>{children}</div>
 }
 
 export default function Sidebar({ productType }: Props) {
@@ -74,6 +75,13 @@ export default function Sidebar({ productType }: Props) {
       {config.hasThickness && (
         <Section>
           <ThicknessPanel options={config.supportedThickness ?? []} />
+        </Section>
+      )}
+
+      {config.hasLaminate && (
+        <Section>
+          {/* 코롯토 라미만 입체(단면 보기) 옵션 추가 */}
+          <LaminatePanel laminateThickness={config.laminateThickness ?? 1} hasEmbossed={productType === 'corolot'} />
         </Section>
       )}
     </aside>

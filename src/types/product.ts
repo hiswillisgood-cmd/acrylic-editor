@@ -30,4 +30,9 @@ export interface ProductConfig {
   hasDualSide: boolean;
   supportedThickness?: number[];
   supportedBasePlates?: BasePlateShape[];
+  // 본체 두께 (mm) — supportedThickness 없을 때 사용
+  defaultThickness: number;
+  // 라미네이트(합지) 옵션 — 뒷면에 추가 acrylic layer
+  hasLaminate?: boolean;
+  laminateThickness?: number; // mm — hasLaminate일 때 적용
 }

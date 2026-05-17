@@ -14,6 +14,8 @@ export interface HistorySnapshot {
   holePosition: HolePosition
   basePlateShape: BasePlateShape
   thickness: number
+  isLaminate: boolean
+  isEmbossed: boolean
   corolotMode: CorolotMode
   activeSide: EditorSide
   cutLineOffset: number
@@ -46,6 +48,8 @@ function snapshotsEqual(a: HistorySnapshot, b: HistorySnapshot): boolean {
   if (a.holeCount !== b.holeCount || a.holePosition !== b.holePosition) return false
   if (a.basePlateShape !== b.basePlateShape) return false
   if (a.thickness !== b.thickness) return false
+  if (a.isLaminate !== b.isLaminate) return false
+  if (a.isEmbossed !== b.isEmbossed) return false
   if (a.corolotMode !== b.corolotMode) return false
   if (a.activeSide !== b.activeSide) return false
   if (a.cutLineOffset !== b.cutLineOffset) return false

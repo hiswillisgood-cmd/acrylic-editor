@@ -24,6 +24,8 @@ function makeSnapshot(s: EditorStore): HistorySnapshot {
     holePosition: s.holePosition,
     basePlateShape: s.basePlateShape,
     thickness: s.thickness,
+    isLaminate: s.isLaminate,
+    isEmbossed: s.isEmbossed,
     corolotMode: s.corolotMode,
     activeSide: s.activeSide,
     cutLineOffset: s.cutLineOffset,
@@ -57,6 +59,16 @@ interface EditorStore {
 
   thickness: number
   setThickness: (t: number) => void
+
+  // 라미네이트 (합지) 옵션 — 뒷면(또는 양면)에 추가 1mm 아크릴 합지
+  isLaminate: boolean
+  setLaminate: (on: boolean) => void
+
+  // 입체 (단면 보기) 옵션 — 라미 코롯토에서만 의미 있음. 화이트/CMYK 순서 반전.
+  // false=양면 보기 라미: 1T라미+CMYK+화이트+7T+CMYK+1T라미
+  // true=입체 단면:      1T라미+화이트+CMYK+7T+화이트+CMYK+1T라미
+  isEmbossed: boolean
+  setEmbossed: (on: boolean) => void
 
   corolotMode: CorolotMode
   setCorolotMode: (mode: CorolotMode) => void
@@ -126,8 +138,14 @@ export const useEditorStore = create<EditorStore>()(persist((set, get) => ({
   basePlateShape: 'circle',
   setBasePlateShape: (shape) => { recordHistory(get); set({ basePlateShape: shape }) },
 
-  thickness: 15,
+  thickness: 3,
   setThickness: (t) => { recordHistory(get); set({ thickness: t }) },
+
+  isLaminate: false,
+  setLaminate: (on) => { recordHistory(get); set({ isLaminate: on }) },
+
+  isEmbossed: false,
+  setEmbossed: (on) => { recordHistory(get); set({ isEmbossed: on }) },
 
   corolotMode: 'same-image',
   setCorolotMode: (mode) => { recordHistory(get); set({ corolotMode: mode }) },
@@ -146,24 +164,49 @@ export const useEditorStore = create<EditorStore>()(persist((set, get) => ({
   selectedImageId: null,
   setSelectedImageId: (id) => set({ selectedImageId: id }),
   addImage: (side, img) => {
-    const key = side === 'front' ? 'frontImages' : 'backImages'
+    const s0 = get()
+    const isDualDifferent = s0.productType === 'corolot' && s0.corolotMode === 'different-image'
     let added = false
     recordHistory(get)
     set((s) => {
+      const key = side === 'front' ? 'frontImages' : 'backImages'
       const list = s[key]
       if (list.length >= MAX_IMAGES_PER_SIDE) return s
       added = true
+      // 양면 다른 그림 모드: 이미지 리소스는 공유. 같은 id/dataUrl/name으로 양면에 모두 추가.
+      // 위치/scale/visibility는 각 면에서 독립적으로 편집 가능.
+      if (isDualDifferent) {
+        const otherKey = side === 'front' ? 'backImages' : 'frontImages'
+        if (s[otherKey].length >= MAX_IMAGES_PER_SIDE) { added = false; return s }
+        return {
+          [key]: [...list, img],
+          [otherKey]: [...s[otherKey], { ...img }],
+        } as Partial<EditorStore>
+      }
       return { [key]: [...list, img] } as Partial<EditorStore>
     })
     return added
   },
   removeImage: (side, id) => {
-    const key = side === 'front' ? 'frontImages' : 'backImages'
+    const s0 = get()
+    const isDualDifferent = s0.productType === 'corolot' && s0.corolotMode === 'different-image'
     recordHistory(get)
-    set((s) => ({
-      [key]: s[key].filter((i) => i.id !== id),
-      selectedImageId: s.selectedImageId === id ? null : s.selectedImageId,
-    } as Partial<EditorStore>))
+    set((s) => {
+      const key = side === 'front' ? 'frontImages' : 'backImages'
+      // 양면 다른 그림 모드에서도 리소스 공유 정책 → 한쪽 삭제 시 반대편도 같은 id 제거
+      if (isDualDifferent) {
+        const otherKey = side === 'front' ? 'backImages' : 'frontImages'
+        return {
+          [key]: s[key].filter((i) => i.id !== id),
+          [otherKey]: s[otherKey].filter((i) => i.id !== id),
+          selectedImageId: s.selectedImageId === id ? null : s.selectedImageId,
+        } as Partial<EditorStore>
+      }
+      return {
+        [key]: s[key].filter((i) => i.id !== id),
+        selectedImageId: s.selectedImageId === id ? null : s.selectedImageId,
+      } as Partial<EditorStore>
+    })
   },
   updateImage: (side, id, patch) => {
     const key = side === 'front' ? 'frontImages' : 'backImages'
@@ -222,7 +265,9 @@ export const useEditorStore = create<EditorStore>()(persist((set, get) => ({
       holeCount: config.hasHole ? 1 : 0,
       holePosition: 'top',
       basePlateShape: 'circle',
-      thickness: config.supportedThickness?.[0] ?? 15,
+      thickness: config.defaultThickness,
+      isLaminate: false,
+      isEmbossed: false,
       corolotMode: 'same-image',
       activeSide: 'front',
       cutLineOffset: DEFAULT_CUT_LINE_OFFSET,
@@ -259,6 +304,8 @@ export const useEditorStore = create<EditorStore>()(persist((set, get) => ({
     holePosition: s.holePosition,
     basePlateShape: s.basePlateShape,
     thickness: s.thickness,
+    isLaminate: s.isLaminate,
+    isEmbossed: s.isEmbossed,
     corolotMode: s.corolotMode,
     activeSide: s.activeSide,
     cutLineOffset: s.cutLineOffset,

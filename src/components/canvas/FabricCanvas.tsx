@@ -452,15 +452,15 @@ export default function FabricCanvas() {
       }
     }
 
-    // 추가 / 업데이트
+    // 추가 / 업데이트 — store의 x/y/scaleX/Y는 zoom=1 기준이라 화면에는 zoom 곱해 적용
     for (const img of activeImages) {
       const existing = map.get(img.id)
       if (existing) {
         existing.set({
-          left: cx + img.x,
-          top: cy + img.y,
-          scaleX: img.scaleX,
-          scaleY: img.scaleY,
+          left: cx + img.x * zoom,
+          top: cy + img.y * zoom,
+          scaleX: img.scaleX * zoom,
+          scaleY: img.scaleY * zoom,
           angle: img.angle,
           visible: img.visible,
         })
@@ -479,17 +479,17 @@ export default function FabricCanvas() {
           if (!st[sideKey].some((i) => i.id === targetImg.id)) return
           // 이미 map에 있으면 중복 추가 방지
           if (map.has(targetImg.id)) return
-          // 첫 추가 시 product 영역에 맞도록 자동 scale (스토어의 1,1을 화면 scale로 환산)
-          const pW = mmToScreenPx(width) * zoom
-          const pH = mmToScreenPx(height) * zoom
+          // 첫 추가 시 product 영역에 맞도록 자동 scale (store는 zoom=1 기준 → mmToScreenPx만 사용)
+          const pW = mmToScreenPx(width)
+          const pH = mmToScreenPx(height)
           const autoFit = Math.min(pW / el.width, pH / el.height) * 0.9
           const sX = targetImg.scaleX === 1 && targetImg.x === 0 && targetImg.y === 0 ? autoFit : targetImg.scaleX
           const sY = targetImg.scaleY === 1 && targetImg.x === 0 && targetImg.y === 0 ? autoFit : targetImg.scaleY
           const fImg = new fabric.FabricImage(el, {
-            left: cx + targetImg.x,
-            top:  cy + targetImg.y,
-            scaleX: sX,
-            scaleY: sY,
+            left: cx + targetImg.x * zoom,
+            top:  cy + targetImg.y * zoom,
+            scaleX: sX * zoom,
+            scaleY: sY * zoom,
             angle: targetImg.angle,
             originX: 'center',
             originY: 'center',
@@ -532,11 +532,13 @@ export default function FabricCanvas() {
       if (!obj || obj._tag !== 'user-image' || !obj._imageId) return
       const cx = canvasSize.w / 2
       const cy = canvasSize.h / 2
+      const z = useEditorStore.getState().zoom || 1
+      // store는 zoom=1 기준 좌표 — 현재 fabric 값을 zoom으로 나눠 역변환
       useEditorStore.getState().updateImage(activeSide, obj._imageId, {
-        x: (obj.left ?? 0) - cx,
-        y: (obj.top  ?? 0) - cy,
-        scaleX: obj.scaleX ?? 1,
-        scaleY: obj.scaleY ?? 1,
+        x: ((obj.left ?? 0) - cx) / z,
+        y: ((obj.top  ?? 0) - cy) / z,
+        scaleX: (obj.scaleX ?? 1) / z,
+        scaleY: (obj.scaleY ?? 1) / z,
         angle:  obj.angle  ?? 0,
       })
     }

@@ -16,6 +16,11 @@ export const PRODUCTS: Record<string, ProductConfig> = {
     hasBasePlate: false,
     hasThickness: false,
     hasDualSide: false,
+    // 일반: 3T 아크릴 + CMYK + 화이트 + CMYK
+    // 라미: + 1T 아크릴 합지
+    defaultThickness: 3,
+    hasLaminate: true,
+    laminateThickness: 1,
   },
   corolot: {
     type: 'corolot',
@@ -32,6 +37,12 @@ export const PRODUCTS: Record<string, ProductConfig> = {
     hasBasePlate: false,
     hasThickness: false,
     hasDualSide: true,
+    // 일반: 7T 아크릴 + CMYK + 화이트 + CMYK
+    // 라미: 1T라미 + CMYK + 화이트 + 7T본체 + CMYK + 1T라미 (양면 보기)
+    // 입체 라미: 1T라미 + 화이트 + CMYK + 7T본체 + 화이트 + CMYK + 1T라미 (단면 보기)
+    defaultThickness: 7,
+    hasLaminate: true,
+    laminateThickness: 1,
   },
   standee: {
     type: 'standee',
@@ -49,6 +60,7 @@ export const PRODUCTS: Record<string, ProductConfig> = {
     hasThickness: true,
     hasDualSide: false,
     supportedThickness: [15, 20, 30],
+    defaultThickness: 15,
     supportedBasePlates: ['circle', 'rectangle', 'square', 'hexagon'],
   },
   'magnet-badge': {
@@ -66,6 +78,7 @@ export const PRODUCTS: Record<string, ProductConfig> = {
     hasBasePlate: false,
     hasThickness: false,
     hasDualSide: false,
+    defaultThickness: 3,
   },
 };
 
