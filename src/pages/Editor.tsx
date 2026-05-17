@@ -19,8 +19,32 @@ export default function Editor() {
 
   useEffect(() => {
     if (!productType || !PRODUCTS[productType]) { navigate('/'); return }
-    resetToProduct(productType as ProductType)
+    // localStorage에 다른 productType이 저장돼 있으면 reset(새 제품), 같으면 복구된 상태 유지
+    const current = useEditorStore.getState().productType
+    if (current !== productType) {
+      resetToProduct(productType as ProductType)
+    }
   }, [productType, navigate, resetToProduct])
+
+  // Ctrl+Z / Ctrl+Shift+Z (또는 Ctrl+Y) 단축키
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return
+      // input/textarea에서는 기본 동작 우선
+      const t = e.target as HTMLElement | null
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+      const key = e.key.toLowerCase()
+      if (key === 'z' && !e.shiftKey) {
+        e.preventDefault()
+        useEditorStore.getState().undo()
+      } else if ((key === 'z' && e.shiftKey) || key === 'y') {
+        e.preventDefault()
+        useEditorStore.getState().redo()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
 
   if (!productType || !PRODUCTS[productType]) return null
   const product = PRODUCTS[productType]

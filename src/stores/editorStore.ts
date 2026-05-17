@@ -1,14 +1,37 @@
 import { create } from 'zustand'
+import { persist, createJSONStorage } from 'zustand/middleware'
 import type { ProductType, BasePlateShape, CorolotMode, HolePosition } from '@/types/product'
 import type { EditorSide, DesignImage } from '@/types/editor'
 import { MAX_IMAGES_PER_SIDE } from '@/types/editor'
 import { PRODUCTS, DEFAULT_CUT_LINE_OFFSET } from '@/config/products'
+import { useHistoryStore, type HistorySnapshot } from './historyStore'
 
 export type CutShape = 'rectangle' | 'circle' | 'freeform'
 
 export interface Point { x: number; y: number }
 
 export type { DesignImage } from '@/types/editor'
+
+// editorStore 상태 → history snapshot 추출
+function makeSnapshot(s: EditorStore): HistorySnapshot {
+  return {
+    productType: s.productType,
+    cutShape: s.cutShape,
+    width: s.width,
+    height: s.height,
+    cornerRadius: s.cornerRadius,
+    holeCount: s.holeCount,
+    holePosition: s.holePosition,
+    basePlateShape: s.basePlateShape,
+    thickness: s.thickness,
+    corolotMode: s.corolotMode,
+    activeSide: s.activeSide,
+    cutLineOffset: s.cutLineOffset,
+    frontImages: s.frontImages,
+    backImages: s.backImages,
+    cutLineSvgData: s.cutLineSvgData,
+  }
+}
 
 interface EditorStore {
   productType: ProductType
@@ -70,41 +93,50 @@ interface EditorStore {
   setPreviewOpen: (open: boolean) => void
 
   resetToProduct: (type: ProductType) => void
+
+  // Undo/Redo
+  undo: () => void
+  redo: () => void
 }
 
-export const useEditorStore = create<EditorStore>((set) => ({
+// 의미 있는 변경 직전에 호출 — history record
+const recordHistory = (get: () => EditorStore) => {
+  useHistoryStore.getState().record(makeSnapshot(get()))
+}
+
+export const useEditorStore = create<EditorStore>()(persist((set, get) => ({
   productType: 'keyring',
-  setProductType: (type) => set({ productType: type }),
+  setProductType: (type) => { recordHistory(get); set({ productType: type }) },
 
   cutShape: 'rectangle',
-  setCutShape: (shape) => set({ cutShape: shape }),
+  setCutShape: (shape) => { recordHistory(get); set({ cutShape: shape }) },
 
   width: 50,
   height: 50,
-  setSize: (w, h) => set({ width: w, height: h }),
+  setSize: (w, h) => { recordHistory(get); set({ width: w, height: h }) },
 
   cornerRadius: 2,
-  setCornerRadius: (r) => set({ cornerRadius: r }),
+  setCornerRadius: (r) => { recordHistory(get); set({ cornerRadius: r }) },
 
   holeCount: 1,
-  setHoleCount: (n) => set({ holeCount: n }),
+  setHoleCount: (n) => { recordHistory(get); set({ holeCount: n }) },
   holePosition: 'top',
-  setHolePosition: (pos) => set({ holePosition: pos }),
+  setHolePosition: (pos) => { recordHistory(get); set({ holePosition: pos }) },
 
   basePlateShape: 'circle',
-  setBasePlateShape: (shape) => set({ basePlateShape: shape }),
+  setBasePlateShape: (shape) => { recordHistory(get); set({ basePlateShape: shape }) },
 
   thickness: 15,
-  setThickness: (t) => set({ thickness: t }),
+  setThickness: (t) => { recordHistory(get); set({ thickness: t }) },
 
   corolotMode: 'same-image',
-  setCorolotMode: (mode) => set({ corolotMode: mode }),
+  setCorolotMode: (mode) => { recordHistory(get); set({ corolotMode: mode }) },
 
   activeSide: 'front',
   setActiveSide: (side) => set({ activeSide: side }),
 
   cutLineOffset: DEFAULT_CUT_LINE_OFFSET,
-  setCutLineOffset: (offset) => set({ cutLineOffset: offset }),
+  setCutLineOffset: (offset) => { recordHistory(get); set({ cutLineOffset: offset }) },
 
   zoom: 1,
   setZoom: (z) => set({ zoom: z }),
@@ -116,6 +148,7 @@ export const useEditorStore = create<EditorStore>((set) => ({
   addImage: (side, img) => {
     const key = side === 'front' ? 'frontImages' : 'backImages'
     let added = false
+    recordHistory(get)
     set((s) => {
       const list = s[key]
       if (list.length >= MAX_IMAGES_PER_SIDE) return s
@@ -126,6 +159,7 @@ export const useEditorStore = create<EditorStore>((set) => ({
   },
   removeImage: (side, id) => {
     const key = side === 'front' ? 'frontImages' : 'backImages'
+    recordHistory(get)
     set((s) => ({
       [key]: s[key].filter((i) => i.id !== id),
       selectedImageId: s.selectedImageId === id ? null : s.selectedImageId,
@@ -133,12 +167,14 @@ export const useEditorStore = create<EditorStore>((set) => ({
   },
   updateImage: (side, id, patch) => {
     const key = side === 'front' ? 'frontImages' : 'backImages'
+    recordHistory(get)
     set((s) => ({
       [key]: s[key].map((i) => (i.id === id ? { ...i, ...patch } : i)),
     } as Partial<EditorStore>))
   },
   reorderImage: (side, id, direction) => {
     const key = side === 'front' ? 'frontImages' : 'backImages'
+    recordHistory(get)
     set((s) => {
       const list = s[key]
       const idx = list.findIndex((i) => i.id === id)
@@ -152,6 +188,7 @@ export const useEditorStore = create<EditorStore>((set) => ({
   },
   moveImageTo: (side, fromId, toId) => {
     const key = side === 'front' ? 'frontImages' : 'backImages'
+    recordHistory(get)
     set((s) => {
       const list = s[key]
       const fromIdx = list.findIndex((i) => i.id === fromId)
@@ -165,7 +202,7 @@ export const useEditorStore = create<EditorStore>((set) => ({
   },
 
   cutLineSvgData: null,
-  setCutLineSvgData: (data) => set({ cutLineSvgData: data }),
+  setCutLineSvgData: (data) => { recordHistory(get); set({ cutLineSvgData: data }) },
 
   cutLinePolygon: null,
   setCutLinePolygon: (pts) => set({ cutLinePolygon: pts }),
@@ -175,6 +212,7 @@ export const useEditorStore = create<EditorStore>((set) => ({
 
   resetToProduct: (type) => {
     const config = PRODUCTS[type]
+    useHistoryStore.getState().clear()
     set({
       productType: type,
       cutShape: 'rectangle',
@@ -197,6 +235,37 @@ export const useEditorStore = create<EditorStore>((set) => ({
       isPreviewOpen: false,
     })
   },
+
+  // Undo/Redo — historyStore의 past/future를 통해 현재 store 상태 교체
+  undo: () => {
+    const prev = useHistoryStore.getState().undo(makeSnapshot(get()))
+    if (prev) set(prev)
+  },
+  redo: () => {
+    const next = useHistoryStore.getState().redo(makeSnapshot(get()))
+    if (next) set(next)
+  },
+}), {
+  name: 'acrylic-editor-state-v1',
+  storage: createJSONStorage(() => localStorage),
+  // 디자인 의도 있는 필드만 persist — 일시 상태(zoom, selection, preview, computed polygon)는 제외
+  partialize: (s) => ({
+    productType: s.productType,
+    cutShape: s.cutShape,
+    width: s.width,
+    height: s.height,
+    cornerRadius: s.cornerRadius,
+    holeCount: s.holeCount,
+    holePosition: s.holePosition,
+    basePlateShape: s.basePlateShape,
+    thickness: s.thickness,
+    corolotMode: s.corolotMode,
+    activeSide: s.activeSide,
+    cutLineOffset: s.cutLineOffset,
+    frontImages: s.frontImages,
+    backImages: s.backImages,
+    cutLineSvgData: s.cutLineSvgData,
+  }),
 }))
 
 // dev 편의: 콘솔에서 store 접근 가능
