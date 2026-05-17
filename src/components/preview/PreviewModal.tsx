@@ -1,14 +1,18 @@
-import { useEffect, useMemo, useState } from 'react'
+import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
 import { useEditorStore } from '@/stores/editorStore'
 import { getCanvasRef } from '@/stores/canvasRef'
 
-type PreviewTab = 'front' | 'white' | 'back' | 'side'
+// 3D 미리보기는 무거운 Three.js 의존성을 가지므로 lazy load — 사용자가 3D 탭 열 때만 다운로드
+const Preview3D = lazy(() => import('./Preview3D'))
+
+type PreviewTab = 'front' | 'white' | 'back' | 'side' | '3d'
 
 const TABS: { value: PreviewTab; label: string }[] = [
   { value: 'front', label: '앞면' },
   { value: 'white', label: '화이트' },
   { value: 'back',  label: '뒷면' },
   { value: 'side',  label: '측면(자동반전)' },
+  { value: '3d',    label: '3D' },
 ]
 
 // 캔버스에서 user-image 객체만 보이게 한 뒤 PNG로 export, 나머지는 일시 숨김
@@ -71,8 +75,9 @@ export default function PreviewModal() {
 
   const displayImage = snapshot
 
+  // 3D 탭은 항상 표시. 양면 제품은 앞/뒤/측면 추가
   const visibleTabs = TABS.filter(t =>
-    hasDualSide || (t.value === 'front' || t.value === 'white')
+    t.value === '3d' || hasDualSide || (t.value === 'front' || t.value === 'white')
   )
 
   const previewW = Math.min(width * 3, 320)
@@ -116,7 +121,13 @@ export default function PreviewModal() {
 
         {/* Preview area */}
         <div className="flex items-center justify-center bg-gray-50 flex-1" style={{ padding: '32px 28px', minHeight: '300px' }}>
-          {isFreeform && cutLineSvgData ? (
+          {activeTab === '3d' ? (
+            <div style={{ width: '100%', height: '360px', position: 'relative' }}>
+              <Suspense fallback={<div className="w-full h-full flex items-center justify-center text-gray-400 text-sm">3D 엔진 로딩 중…</div>}>
+                <Preview3D />
+              </Suspense>
+            </div>
+          ) : isFreeform && cutLineSvgData ? (
             // 자유형: SVG 칼선 위에 이미지 오버레이
             <div className="relative flex items-center justify-center" style={{ width: previewW, height: previewH }}>
               <div
